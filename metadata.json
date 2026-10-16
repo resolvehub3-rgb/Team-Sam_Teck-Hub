@@ -1,0 +1,12 @@
+{
+  "name": "Sam_Teck Hub",
+  "description": "Production-ready SaaS workspace for project management, team collaboration, Sam_Teck Meet virtual meetings, technology development, learning centre, and operational reporting.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
