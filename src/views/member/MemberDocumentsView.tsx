@@ -15,7 +15,11 @@ import { describeAccessError, formatBytes, formatRelativeTime } from '../../util
 import { Chip, EmptyState, ErrorState, LoadingState, PageHeader, buttonStyles } from '../../components/ui';
 
 const CATEGORIES = ['Specification', 'Design', 'Report', 'Policy', 'Reference', 'Other'] as const;
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+// Mirrors MAX_DOCUMENT_BYTES in server.ts. Vercel caps request bodies at
+// 4.5 MB, so the server accepts 4 MB; keeping this identical means the browser
+// rejects an oversized file with a readable message rather than letting it
+// travel to the server and fail there.
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
 
 /**
  * Document library for members. Files live in a private storage bucket
@@ -100,7 +104,7 @@ export const MemberDocumentsView: React.FC = () => {
       return;
     }
     if (file && file.size > MAX_UPLOAD_BYTES) {
-      setFormError(`Files must be 10 MB or smaller — "${file.name}" is ${formatBytes(file.size)}.`);
+      setFormError(`Files must be 4 MB or smaller - "${file.name}" is ${formatBytes(file.size)}.`);
       return;
     }
 

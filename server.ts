@@ -3,7 +3,6 @@ import dotenv from 'dotenv';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
 import { createClient } from '@supabase/supabase-js';
 import { AccessToken } from 'livekit-server-sdk';
 import { validateFirstTimeSetupPayload } from './src/utils/rules.ts';
@@ -919,7 +918,13 @@ app.post('/api/members/:userId/delete', requireAuth, async (req: AuthedRequest, 
 //     confusing RLS error. Serving the bytes through the authenticated server
 //     keeps the library usable and lets the organisation be enforced on the
 //     backend, independently of the frontend.
-const MAX_DOCUMENT_BYTES = 10 * 1024 * 1024;
+//
+//     The cap is 4 MB rather than the 10 MB this started at: Vercel rejects any
+//     request body over 4.5 MB at the platform edge, before this code runs, so
+//     a higher limit here would simply produce a confusing failure for anyone
+//     uploading a large file. Raising it means moving uploads to a different
+//     path - a signed direct-to-storage upload, for instance.
+const MAX_DOCUMENT_BYTES = 4 * 1024 * 1024;
 const DOCUMENT_BUCKET = 'documents';
 
 /** Roles that may open or delete any file inside their organisation. */
@@ -1614,6 +1619,10 @@ app.post('/api/invitations/:token/accept', async (req: Request, res: Response) =
 // Start Express server and mount Vite middleware
 async function startServer() {
   if (!isProduction) {
+    // Imported lazily: `vite` is a build-time dependency and pulling it into
+    // the module graph would drag the whole bundler into the serverless
+    // function bundle on Vercel.
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -1631,7 +1640,17 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('[Sam_Teck Hub] Failed to start server:', err);
-  process.exit(1);
-});
+// `app` is the whole API surface. Exporting it lets Vercel mount it as a
+// serverless function (see api/index.ts) instead of binding a port, which a
+// serverless runtime has no use for. The `listen()` path below stays for local
+// development and any self-hosted deployment.
+export default app;
+
+const isServerless = Boolean(process.env.VERCEL);
+
+if (!isServerless) {
+  startServer().catch((err) => {
+    console.error('[Sam_Teck Hub] Failed to start server:', err);
+    process.exit(1);
+  });
+}

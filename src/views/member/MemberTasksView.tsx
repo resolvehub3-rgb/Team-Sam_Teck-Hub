@@ -44,7 +44,11 @@ const STATUS_LABEL: Record<TaskStatus, string> = {
 
 const PRIORITY_RANK: Record<TaskPriority, number> = { urgent: 0, high: 1, medium: 2, low: 3 };
 
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+// Mirrors MAX_DOCUMENT_BYTES in server.ts. Vercel caps request bodies at
+// 4.5 MB, so the server accepts 4 MB; keeping this identical means the browser
+// rejects an oversized file with a readable message rather than letting it
+// travel to the server and fail there.
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
 
 interface TaskCommentRow {
   id: string;
@@ -235,7 +239,7 @@ export const MemberTasksView: React.FC = () => {
   const uploadAttachment = async (file: File) => {
     if (!selected || !user || !organization) return;
     if (file.size > MAX_UPLOAD_BYTES) {
-      setActionError(`Files must be 10 MB or smaller — "${file.name}" is ${formatBytes(file.size)}.`);
+      setActionError(`Files must be 4 MB or smaller - "${file.name}" is ${formatBytes(file.size)}.`);
       return;
     }
     setUploading(true);

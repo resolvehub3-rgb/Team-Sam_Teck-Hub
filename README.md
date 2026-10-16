@@ -197,6 +197,82 @@ npm start
 
 ---
 
-## 10. License
+## 10. Deploying to Vercel
+
+The app splits into two pieces on Vercel: the Vite build is served as static
+files by the CDN, and `server.ts` runs as a single serverless function mounted
+by `api/index.ts`. All `/api/*` traffic is rewritten to that function
+(`vercel.json`); every other path falls through to `index.html` for
+client-side routing.
+
+### How the split works
+
+- `server.ts` exports the Express `app` and skips `app.listen()` whenever
+  `process.env.VERCEL` is set, so importing it into a function does not try to
+  bind a port.
+- The `vite` import is lazy (dynamic) and only runs in local development, so
+  the bundler is not pulled into the serverless bundle.
+- Document uploads are capped at **4 MB** rather than 10 MB, because Vercel
+  rejects request bodies over 4.5 MB at the platform edge. Raising this means
+  moving uploads to signed direct-to-storage uploads.
+
+### One-time setup
+
+```bash
+npm install -g vercel   # if not already installed
+vercel login
+vercel link             # attach this folder to a Vercel project
+```
+
+### Required environment variables
+
+Set these in the Vercel project under **Settings → Environment Variables**
+(Production). They are needed at **build time** as well as runtime, because
+`VITE_*` values are inlined into the browser bundle during `vite build`:
+
+| Variable | Purpose |
+| --- | --- |
+| `VITE_SUPABASE_URL` | Supabase project URL (baked into the client bundle) |
+| `VITE_SUPABASE_ANON_KEY` | Supabase anon key (baked into the client bundle) |
+| `SUPABASE_SERVICE_ROLE_KEY` | Server-only. Never exposed to the browser |
+| `APP_URL` | Public URL of this deployment. Builds invitation links |
+| `LIVEKIT_URL` | LiveKit Cloud WebSocket URL for Sam_Teck Meet |
+| `LIVEKIT_API_KEY` | LiveKit API key (server-only) |
+| `LIVEKIT_API_SECRET` | LiveKit API secret (server-only) |
+| `SETUP_PROVISIONING_SECRET` | Optional first-run provisioning token |
+
+> `APP_URL` must be the real public URL (e.g. `https://your-app.vercel.app`),
+> not `localhost`. Invitation links are constructed from it, so a wrong value
+> sends members to a link that does not resolve.
+
+### Supabase redirect allow-list (required for invitations)
+
+Supabase Auth validates the invitation `redirectTo` host against an allow-list,
+so the Vercel domain must be registered or invitation emails will bounce:
+
+1. Open the Supabase dashboard → **Authentication → URL Configuration**.
+2. Set **Site URL** to your Vercel URL.
+3. Add `https://your-app.vercel.app/**` to **Redirect URLs**.
+
+### Deploy
+
+```bash
+vercel --prod
+```
+
+### Known platform limits
+
+- **4.5 MB request body cap** — document uploads are limited to 4 MB to stay
+  under it.
+- **60 s function timeout** — configured in `vercel.json`. First-run
+  administrator provisioning pages through the user directory and may approach
+  this on very large organizations.
+- **No persistent in-memory state** — `hasProvisionedInitialAdmin` is
+  per-instance and resets between invocations; the setup flow already falls
+  back to the `system_settings` row in the database, so behaviour is unchanged.
+
+---
+
+## 11. License
 
 Licensed under the Apache License, Version 2.0.
