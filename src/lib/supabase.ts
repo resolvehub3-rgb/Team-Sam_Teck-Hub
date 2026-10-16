@@ -27,6 +27,18 @@ export const supabase: SupabaseClient = createClient(safeUrl, safeKey, {
   },
 });
 
+/**
+ * Authorization header carrying the caller's live session token.
+ *
+ * Every request to a protected `/api/*` route must send this: the server
+ * derives the caller's identity from the verified token, never from anything
+ * in the request body, so a missing header means a 401 rather than a guess.
+ */
+export async function getAuthHeader(): Promise<Record<string, string>> {
+  const token = await supabase.auth.getSession().then((s) => s.data.session?.access_token);
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 export function configureRuntimeSupabase(url: string, key: string) {
   if (typeof window !== 'undefined') {
     (window as unknown as { __SUPABASE_URL: string }).__SUPABASE_URL = url;

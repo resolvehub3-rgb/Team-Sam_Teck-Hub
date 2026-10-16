@@ -61,6 +61,9 @@ export const MeetingRoomView: React.FC<MeetingRoomViewProps> = ({ meeting, onLea
   // Token state from LiveKit backend
   const [livekitToken, setLivekitToken] = useState<string | null>(null);
   const [livekitError, setLivekitError] = useState<string | null>(null);
+  const [joinError, setJoinError] = useState<string | null>(null);
+  const [joining, setJoining] = useState(false);
+  const [actionItemError, setActionItemError] = useState<string | null>(null);
 
   // Initialize camera and microphone preview for Pre-join
   useEffect(() => {
@@ -132,35 +135,54 @@ export const MeetingRoomView: React.FC<MeetingRoomViewProps> = ({ meeting, onLea
     fetchMeetingRecords();
   }, [meeting.id]);
 
-  // Request LiveKit room token from backend server
-  const requestRoomToken = async () => {
+  // Request LiveKit room token from the backend. The server verifies our
+  // session, checks we are entitled to the room, and derives our identity
+  // from the verified token — it never trusts the request body.
+  const requestRoomToken = async (): Promise<'ok' | 'not_configured' | 'error'> => {
     try {
+      const sessionToken = await supabase.auth.getSession().then((s) => s.data.session?.access_token);
+      if (!sessionToken) {
+        setJoinError('Your session has expired. Sign in again before joining the meeting.');
+        return 'error';
+      }
+
       const res = await fetch('/api/meet/token', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
         body: JSON.stringify({
           roomName: meeting.livekit_room_name,
-          participantIdentity: user?.id || 'guest-' + Math.random().toString(36).substring(7),
           participantName: profile?.full_name || user?.email?.split('@')[0] || 'Participant',
-          isHost: meeting.host_id === user?.id,
         }),
       });
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (res.ok && data.token) {
         setLivekitToken(data.token);
-      } else if (data.error === 'LIVEKIT_NOT_CONFIGURED') {
+        setJoinError(null);
+        return 'ok';
+      }
+      if (data.error === 'LIVEKIT_NOT_CONFIGURED') {
         // Backend informs that LiveKit Cloud credentials are not configured yet
         setLivekitError(data.message);
+        setJoinError(null);
+        return 'not_configured';
       }
+      setJoinError(data.message || data.error || 'The meeting room could not be opened.');
+      return 'error';
     } catch (err) {
       console.warn('Could not contact LiveKit token endpoint:', err);
+      setJoinError('Could not reach the meeting service. Check your connection and try again.');
+      return 'error';
     }
   };
 
   const handleJoinMeeting = async () => {
-    await requestRoomToken();
-    setHasJoined(true);
+    setJoinError(null);
+    // Never enter the room before the server has authorised us.
+    const outcome = await requestRoomToken();
+    if (outcome !== 'error') {
+      setHasJoined(true);
+    }
   };
 
   const toggleCamera = () => {
@@ -281,36 +303,38 @@ export const MeetingRoomView: React.FC<MeetingRoomViewProps> = ({ meeting, onLea
     const projId = selectedActionProject || null;
     setNewActionTitle('');
     setNewActionDueDate('');
+    setActionItemError(null);
 
-    if (isSupabaseConfigured()) {
-      const { data } = await supabase
-        .from('meeting_action_items')
-        .insert({
-          meeting_id: meeting.id,
-          title,
-          project_id: projId,
-          due_date: dueDate,
-          is_converted_to_task: false,
-        })
-        .select('*, project:projects(*)')
-        .single();
-
-      if (data) setActionItems((prev) => [...prev, data as MeetingActionItem]);
-    } else {
-      setActionItems((prev) => [
-        ...prev,
-        {
-          id: 'act-' + Date.now(),
-          meeting_id: meeting.id,
-          title,
-          project_id: projId || undefined,
-          due_date: dueDate || undefined,
-          is_converted_to_task: false,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        },
-      ]);
+    if (!isSupabaseConfigured()) {
+      setActionItemError('Supabase is not configured, so action items cannot be recorded.');
+      return;
     }
+
+    const { data, error } = await supabase
+      .from('meeting_action_items')
+      .insert({
+        meeting_id: meeting.id,
+        title,
+        project_id: projId,
+        due_date: dueDate,
+        is_converted_to_task: false,
+      })
+      .select('*, project:projects(*)')
+      .single();
+
+    if (error || !data) {
+      // Put the values back so nothing the user typed is lost, and say why.
+      setNewActionTitle(title);
+      setNewActionDueDate(dueDate || '');
+      setSelectedActionProject(projId || '');
+      setActionItemError(
+        error?.message ||
+          'The action item could not be saved. You may not have permission to add one to this meeting.'
+      );
+      return;
+    }
+
+    setActionItems((prev) => [...prev, data as MeetingActionItem]);
   };
 
   // CONVERT ACTION ITEM TO REAL PROJECT TASK (Section 11)
@@ -322,16 +346,20 @@ export const MeetingRoomView: React.FC<MeetingRoomViewProps> = ({ meeting, onLea
 
     setConvertingActionId(actionItem.id);
     try {
+      const sessionToken = await supabase.auth.getSession().then((s) => s.data.session?.access_token);
+      if (!sessionToken) {
+        throw new Error('Your session has expired. Sign in again before converting this action item.');
+      }
+
       const res = await fetch('/api/meet/action-items/convert', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
         body: JSON.stringify({
           actionItemId: actionItem.id,
           projectId: actionItem.project_id,
           title: actionItem.title,
           description: `Action item originating from meeting "${meeting.title}"`,
           dueDate: actionItem.due_date,
-          createdBy: user?.id,
         }),
       });
 
@@ -422,6 +450,13 @@ export const MeetingRoomView: React.FC<MeetingRoomViewProps> = ({ meeting, onLea
               </div>
             )}
 
+            {joinError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700 flex items-start gap-2" role="alert">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>{joinError}</span>
+              </div>
+            )}
+
             <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-2">
               <div className="text-left">
                 <span className="text-xs text-[#65758B]">Joining as:</span>
@@ -432,9 +467,10 @@ export const MeetingRoomView: React.FC<MeetingRoomViewProps> = ({ meeting, onLea
 
               <button
                 onClick={handleJoinMeeting}
-                className="w-full sm:w-auto px-6 py-3 bg-[#123B73] hover:bg-[#2457A7] text-white font-bold text-sm rounded-xl transition shadow-md flex items-center justify-center gap-2"
+                disabled={joining}
+                className="w-full sm:w-auto px-6 py-3 bg-[#123B73] hover:bg-[#2457A7] text-white font-bold text-sm rounded-xl transition shadow-md flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                <span>Join Meeting Now</span>
+                <span>{joining ? 'Authorising…' : 'Join Meeting Now'}</span>
                 <ArrowRight className="w-4 h-4" />
               </button>
             </div>
@@ -664,6 +700,14 @@ export const MeetingRoomView: React.FC<MeetingRoomViewProps> = ({ meeting, onLea
                 {/* Follow-up Action Items with Conversion to Tasks */}
                 <div className="pt-2 border-t border-[#123B73]">
                   <h4 className="font-bold text-blue-300 mb-2">Follow-Up Action Items</h4>
+                  {actionItemError && (
+                    <div
+                      className="mb-2 p-2 bg-red-500/15 border border-red-400/40 rounded text-[11px] text-red-200"
+                      role="alert"
+                    >
+                      {actionItemError}
+                    </div>
+                  )}
                   <form onSubmit={handleAddActionItem} className="space-y-2 mb-3 bg-[#123B73]/30 p-2.5 rounded-lg border border-[#2457A7]/40">
                     <input
                       type="text"

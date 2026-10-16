@@ -19,6 +19,8 @@ interface NavbarProps {
   onToggleMobileSidebar: () => void;
   unreadNotificationsCount?: number;
   onNavigateToNotifications?: () => void;
+  /** Rendered before the quick actions — used for the workspace switcher. */
+  workspaceSwitcher?: React.ReactNode;
 }
 
 const roleDisplayMap: Record<UserRole, { label: string; badgeClass: string }> = {
@@ -36,6 +38,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   onToggleMobileSidebar,
   unreadNotificationsCount = 0,
   onNavigateToNotifications,
+  workspaceSwitcher,
 }) => {
   const { user, profile, role, organization, signOut } = useAuth();
   const [profileDropdownOpen, setProfileDropdownOpen] = useState(false);
@@ -76,6 +79,8 @@ export const Navbar: React.FC<NavbarProps> = ({
 
         {/* Center / Right: Quick Actions, Sam_Teck Meet shortcut, User status */}
         <div className="flex items-center gap-2 sm:gap-3">
+          {workspaceSwitcher}
+
           {/* Sam_Teck Meet Instant Trigger */}
           <button
             onClick={onOpenInstantMeeting}

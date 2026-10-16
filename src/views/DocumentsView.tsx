@@ -10,7 +10,7 @@ import {
   CheckCircle2
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
-import { supabase, isSupabaseConfigured } from '../lib/supabase';
+import { supabase, isSupabaseConfigured, getAuthHeader } from '../lib/supabase';
 import { DocumentItem, Project } from '../types/database';
 
 export const DocumentsView: React.FC = () => {
@@ -56,21 +56,37 @@ export const DocumentsView: React.FC = () => {
   const handleUploadDocument = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!docTitle.trim() || !user) return;
+    if (!organization?.id) {
+      alert('Your account is not linked to an organization, so a document cannot be recorded.');
+      return;
+    }
     setIsUploading(true);
 
     try {
-      const orgId = organization?.id || '00000000-0000-0000-0000-000000000000';
-      const fileName = selectedFile ? selectedFile.name : `${docTitle.toLowerCase().replace(/[^a-z0-9]/g, '-')}.pdf`;
-      const filePath = `documents/${orgId}/${Date.now()}_${fileName}`;
-
-      // If a real file is attached and storage bucket exists, upload to Supabase Storage
+      // If a real file is attached, it must actually land in storage before
+      // any metadata row is written — a failed upload is reported, not
+      // silently swallowed. The bytes go through the authenticated server so
+      // the path is scoped to this organisation and this user.
+      let filePath: string | null = null;
       if (selectedFile && isSupabaseConfigured()) {
-        try {
-          await supabase.storage.from('documents').upload(filePath, selectedFile);
-        } catch (storageErr) {
-          console.warn('Storage upload note:', storageErr);
+        const res = await fetch('/api/documents/upload', {
+          method: 'POST',
+          headers: {
+            'Content-Type': selectedFile.type || 'application/octet-stream',
+            'x-file-name': selectedFile.name,
+            ...(await getAuthHeader()),
+          },
+          body: selectedFile,
+        });
+        const data: { path?: string; error?: string } = await res.json().catch(() => ({ error: 'No response was received.' }));
+        if (!res.ok || !data.path) {
+          throw new Error(data.error || 'The file could not be uploaded. Try again.');
         }
+        filePath = data.path;
       }
+
+      const orgId = organization.id;
+      const fileName = selectedFile ? selectedFile.name : `${docTitle.toLowerCase().replace(/[^a-z0-9]/g, '-')}.txt`;
 
       // Record metadata in public.documents
       if (isSupabaseConfigured()) {
@@ -80,10 +96,10 @@ export const DocumentsView: React.FC = () => {
           title: docTitle.trim(),
           description: docDesc.trim() || null,
           category: docCategory,
-          file_path: filePath,
+          file_path: filePath || '',
           file_name: fileName,
-          file_size: selectedFile ? selectedFile.size : 1024,
-          mime_type: selectedFile ? selectedFile.type : 'application/pdf',
+          file_size: selectedFile ? selectedFile.size : 0,
+          mime_type: selectedFile ? selectedFile.type || null : null,
           uploaded_by: user.id,
         });
 
@@ -96,7 +112,13 @@ export const DocumentsView: React.FC = () => {
       setSelectedFile(null);
       fetchDocuments();
     } catch (err) {
-      alert('Upload failed: ' + (err instanceof Error ? err.message : 'Unknown error'));
+      const msg =
+        err && typeof err === 'object' && 'message' in err && typeof (err as { message?: unknown }).message === 'string'
+          ? (err as { message: string }).message
+          : err instanceof Error
+            ? err.message
+            : 'Unknown error';
+      alert('Upload failed: ' + msg);
     } finally {
       setIsUploading(false);
     }

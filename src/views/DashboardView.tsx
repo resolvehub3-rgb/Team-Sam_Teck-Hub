@@ -77,7 +77,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       setMeetings((meetingData as Meeting[]) || []);
 
       // 4. Announcements
-      let annQuery = supabase.from('announcements').select('*, author:profiles(*)').order('created_at', { ascending: false }).limit(5);
+      // `announcement_reads` adds a second path from announcements to
+      // profiles, so the author relationship must be named explicitly.
+      let annQuery = supabase.from('announcements').select('*, author:profiles!author_id(*)').order('created_at', { ascending: false }).limit(5);
       if (organization?.id) {
         annQuery = annQuery.eq('organization_id', organization.id);
       }

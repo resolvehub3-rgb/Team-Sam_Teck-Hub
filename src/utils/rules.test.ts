@@ -5,6 +5,7 @@ import {
   filterOverdueTasks,
   isTaskDueSoon,
   checkRolePermission,
+  isLeadershipRole,
   calculateAttendanceDuration,
   validateFirstTimeSetupPayload,
   calculateProjectBudgetStats,
@@ -56,6 +57,51 @@ test('checkRolePermission grants access based on authorized role hierarchy', () 
   assert.equal(checkRolePermission('team_member', 'create_project'), false);
   assert.equal(checkRolePermission('team_member', 'manage_meeting'), true);
   assert.equal(checkRolePermission('guest', 'manage_meeting'), false);
+});
+
+test('checkRolePermission restricts meeting deletion to super_admin only', () => {
+  assert.equal(checkRolePermission('super_admin', 'delete_meeting'), true);
+  assert.equal(checkRolePermission('team_leader', 'delete_meeting'), false);
+  assert.equal(checkRolePermission('assistant_leader', 'delete_meeting'), false);
+  assert.equal(checkRolePermission('project_manager', 'delete_meeting'), false);
+  assert.equal(checkRolePermission('department_lead', 'delete_meeting'), false);
+  assert.equal(checkRolePermission('team_member', 'delete_meeting'), false);
+  assert.equal(checkRolePermission('guest', 'delete_meeting'), false);
+  assert.equal(checkRolePermission(undefined, 'delete_meeting'), false);
+});
+
+test('checkRolePermission gates the Administration Portal to super admins and team leaders', () => {
+  assert.equal(checkRolePermission('super_admin', 'access_admin_portal'), true);
+  assert.equal(checkRolePermission('team_leader', 'access_admin_portal'), true);
+  assert.equal(checkRolePermission('assistant_leader', 'access_admin_portal'), false);
+  assert.equal(checkRolePermission('project_manager', 'access_admin_portal'), false);
+  assert.equal(checkRolePermission('department_lead', 'access_admin_portal'), false);
+  assert.equal(checkRolePermission('team_member', 'access_admin_portal'), false);
+  assert.equal(checkRolePermission('guest', 'access_admin_portal'), false);
+});
+
+test('checkRolePermission reserves announcements and learning management for leadership', () => {
+  assert.equal(checkRolePermission('super_admin', 'publish_announcement'), true);
+  assert.equal(checkRolePermission('department_lead', 'publish_announcement'), true);
+  assert.equal(checkRolePermission('project_manager', 'publish_announcement'), false);
+  assert.equal(checkRolePermission('team_member', 'publish_announcement'), false);
+  assert.equal(checkRolePermission('guest', 'publish_announcement'), false);
+
+  assert.equal(checkRolePermission('team_leader', 'manage_learning'), true);
+  assert.equal(checkRolePermission('department_lead', 'manage_learning'), true);
+  assert.equal(checkRolePermission('assistant_leader', 'manage_learning'), false);
+  assert.equal(checkRolePermission('team_member', 'manage_learning'), false);
+});
+
+test('isLeadershipRole identifies every privileged role and rejects ordinary ones', () => {
+  assert.equal(isLeadershipRole('super_admin'), true);
+  assert.equal(isLeadershipRole('team_leader'), true);
+  assert.equal(isLeadershipRole('assistant_leader'), true);
+  assert.equal(isLeadershipRole('department_lead'), true);
+  assert.equal(isLeadershipRole('project_manager'), false);
+  assert.equal(isLeadershipRole('team_member'), false);
+  assert.equal(isLeadershipRole('guest'), false);
+  assert.equal(isLeadershipRole(undefined), false);
 });
 
 test('calculateAttendanceDuration computes accurate seconds', () => {

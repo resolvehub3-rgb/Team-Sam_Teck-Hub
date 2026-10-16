@@ -11,6 +11,12 @@ interface AuthContextType {
   membership: OrganizationMembership | null;
   role: UserRole | null;
   isLoading: boolean;
+  /**
+   * True once the membership lookup behind `role` has finished (successfully
+   * or not). Routing uses this so it never writes a URL for a role it has not
+   * actually learned yet.
+   */
+  roleLoaded: boolean;
   systemSetupStatus: {
     checked: boolean;
     initialAdminProvisioned: boolean;
@@ -32,6 +38,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [membership, setMembership] = useState<OrganizationMembership | null>(null);
   const [role, setRole] = useState<UserRole | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [roleLoaded, setRoleLoaded] = useState(false);
   const [systemSetupStatus, setSystemSetupStatus] = useState({
     checked: false,
     initialAdminProvisioned: false,
@@ -56,6 +63,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const loadUserProfile = async (currentUser: User) => {
     if (!isSupabaseConfigured()) {
+      setRoleLoaded(true);
       setIsLoading(false);
       return;
     }
@@ -104,6 +112,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch (err) {
       console.error('Failed to load user profile & membership:', err);
     } finally {
+      setRoleLoaded(true);
       setIsLoading(false);
     }
   };
@@ -112,6 +121,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     checkSetupStatus();
 
     if (!isSupabaseConfigured()) {
+      setRoleLoaded(true);
       setIsLoading(false);
       return;
     }
@@ -127,6 +137,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setOrganization(null);
         setMembership(null);
         setRole(null);
+        setRoleLoaded(true);
         setIsLoading(false);
       }
     });
@@ -138,6 +149,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (currentUser) {
         loadUserProfile(currentUser);
       } else {
+        setRoleLoaded(true);
         setIsLoading(false);
       }
     });
@@ -234,6 +246,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         membership,
         role,
         isLoading,
+        roleLoaded,
         systemSetupStatus,
         signIn,
         signUp,

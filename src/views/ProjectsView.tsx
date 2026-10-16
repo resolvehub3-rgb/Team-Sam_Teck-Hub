@@ -18,6 +18,7 @@ import { useAuth } from '../context/AuthContext';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { Project, Task, TaskStatus, TaskPriority, Milestone } from '../types/database';
 import { calculateTaskProgress } from '../utils/rules';
+import { getErrorMessage } from '../utils/format';
 
 const KANBAN_COLUMNS: { id: TaskStatus; label: string; color: string }[] = [
   { id: 'backlog', label: 'Backlog', color: 'bg-slate-100 text-slate-700 border-slate-300' },
@@ -29,7 +30,11 @@ const KANBAN_COLUMNS: { id: TaskStatus; label: string; color: string }[] = [
 ];
 
 export const ProjectsView: React.FC = () => {
-  const { user, organization, role } = useAuth();
+  const { user, organization, role, hasPermission } = useAuth();
+  // Project creation is restricted by the `can_create_project()` RLS policy —
+  // this gate only keeps a dead button out of the UI, the database still has
+  // the final say.
+  const canCreateProject = hasPermission('create_project');
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -90,7 +95,7 @@ export const ProjectsView: React.FC = () => {
       // 1. Fetch tasks
       const { data: taskData, error: taskErr } = await supabase
         .from('tasks')
-        .select('*, assignee:profiles(*)')
+        .select('*, assignee:profiles!assignee_id(*)')
         .eq('project_id', projectId)
         .order('created_at', { ascending: false });
       if (taskErr) throw taskErr;
@@ -151,7 +156,10 @@ export const ProjectsView: React.FC = () => {
 
     try {
       const slug = newProjectName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
-      const orgId = organization?.id || '00000000-0000-0000-0000-000000000000';
+      if (!organization?.id) {
+        throw new Error('Your account is not linked to an organization, so a project cannot be created.');
+      }
+      const orgId = organization.id;
 
       const { data, error } = await supabase
         .from('projects')
@@ -181,7 +189,7 @@ export const ProjectsView: React.FC = () => {
       if (data) setSelectedProject(data as Project);
     } catch (err) {
       console.error('Failed to insert project into Supabase:', err);
-      alert('Error creating project: ' + (err instanceof Error ? err.message : 'Unknown error'));
+      alert('Error creating project: ' + getErrorMessage(err, 'Unknown error'));
     } finally {
       setIsSubmittingProject(false);
     }
@@ -206,7 +214,7 @@ export const ProjectsView: React.FC = () => {
           acceptance_criteria: newTaskCriteria.trim() || null,
           created_by: user.id,
         })
-        .select('*, assignee:profiles(*)')
+        .select('*, assignee:profiles!assignee_id(*)')
         .single();
 
       if (error) throw error;
@@ -220,7 +228,7 @@ export const ProjectsView: React.FC = () => {
       }
     } catch (err) {
       console.error('Failed to insert task into Supabase:', err);
-      alert('Error creating task: ' + (err instanceof Error ? err.message : 'Unknown error'));
+      alert('Error creating task: ' + getErrorMessage(err, 'Unknown error'));
     } finally {
       setIsSubmittingTask(false);
     }
@@ -243,13 +251,19 @@ export const ProjectsView: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2">
-          <button
-            onClick={() => setShowCreateProject(true)}
-            className="px-3.5 py-2 bg-[#123B73] hover:bg-[#2457A7] text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow-xs"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            New Project
-          </button>
+          {canCreateProject ? (
+            <button
+              onClick={() => setShowCreateProject(true)}
+              className="px-3.5 py-2 bg-[#123B73] hover:bg-[#2457A7] text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow-xs"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              New Project
+            </button>
+          ) : (
+            <span className="px-3 py-2 text-[11px] text-[#65758B] border border-dashed border-[#DCE5F0] rounded-lg">
+              Creating projects is limited to project leads
+            </span>
+          )}
         </div>
       </div>
 
@@ -263,13 +277,19 @@ export const ProjectsView: React.FC = () => {
           <p className="text-xs text-[#65758B] mt-1.5 mb-6">
             Create your first project to start tracking work, assigning tasks to team members, and collaborating on milestones.
           </p>
-          <button
-            onClick={() => setShowCreateProject(true)}
-            className="px-4 py-2.5 bg-[#123B73] hover:bg-[#2457A7] text-white text-xs font-semibold rounded-lg transition shadow-xs inline-flex items-center gap-2"
-          >
-            <Plus className="w-4 h-4" />
-            Create Project
-          </button>
+          {canCreateProject ? (
+            <button
+              onClick={() => setShowCreateProject(true)}
+              className="px-4 py-2.5 bg-[#123B73] hover:bg-[#2457A7] text-white text-xs font-semibold rounded-lg transition shadow-xs inline-flex items-center gap-2"
+            >
+              <Plus className="w-4 h-4" />
+              Create Project
+            </button>
+          ) : (
+            <p className="text-[11px] text-[#65758B]">
+              Ask a project lead to create a project and add you to its team.
+            </p>
+          )}
         </div>
       ) : (
         /* Workspace layout: Project Selector Bar + Active Project Workboard */

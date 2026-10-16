@@ -10,12 +10,24 @@ import {
   FileText,
   X,
   Radio,
-  CheckCircle2
+  CheckCircle2,
+  Trash2,
+  Loader2
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { Meeting, Project } from '../types/database';
 import { MeetingRoomView } from './MeetingRoomView';
+
+// Supabase/Postgrest errors are plain objects, not Error instances.
+const getErrorMessage = (err: unknown, fallback: string): string => {
+  if (err && typeof err === 'object' && 'message' in err) {
+    const msg = (err as { message?: unknown }).message;
+    if (typeof msg === 'string' && msg.trim()) return msg;
+  }
+  if (err instanceof Error && err.message) return err.message;
+  return fallback;
+};
 
 interface SamTeckMeetViewProps {
   initialMeetingSlug?: string;
@@ -26,11 +38,17 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
   initialMeetingSlug,
   onClearMeetingSlug,
 }) => {
-  const { user, organization } = useAuth();
+  const { user, organization, hasPermission } = useAuth();
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [activeMeeting, setActiveMeeting] = useState<Meeting | null>(null);
+
+  // Delete Meeting
+  const canDeleteMeeting = hasPermission('delete_meeting');
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<Meeting | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   // Schedule Modal
   const [showScheduleModal, setShowScheduleModal] = useState(false);
@@ -42,12 +60,14 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
   const [newProjectId, setNewProjectId] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  const fetchMeetings = async () => {
+  // `silent` avoids flipping the loading spinner — used by realtime refreshes
+  // and by post-delete refreshes so the list doesn't blank out.
+  const fetchMeetings = async (opts: { silent?: boolean } = {}) => {
     if (!isSupabaseConfigured()) {
       setLoading(false);
       return;
     }
-    setLoading(true);
+    if (!opts.silent) setLoading(true);
     try {
       let query = supabase.from('meetings').select('*, host:profiles(*), project:projects(*)').order('start_time', { ascending: true });
       if (organization?.id) {
@@ -72,13 +92,41 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
     } catch (err) {
       console.error('Error fetching meetings:', err);
     } finally {
-      setLoading(false);
+      if (!opts.silent) setLoading(false);
     }
   };
 
   useEffect(() => {
     fetchMeetings();
   }, [organization?.id, initialMeetingSlug]);
+
+  // REALTIME: subscribe to meetings changes so a delete (by anyone) is
+  // reflected on every connected client immediately.
+  useEffect(() => {
+    if (!isSupabaseConfigured() || !organization?.id) return;
+
+    const channel = supabase
+      .channel(`meetings-org-${organization.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'meetings', filter: `organization_id=eq.${organization.id}` },
+        (payload) => {
+          // Optimistic removal keeps the UI instant even if the refetch is slow.
+          if (payload.eventType === 'DELETE') {
+            const oldRow = payload.old as { id?: string };
+            if (oldRow?.id) {
+              setMeetings((prev) => prev.filter((m) => m.id !== oldRow.id));
+            }
+          }
+          fetchMeetings({ silent: true });
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [organization?.id]);
 
   // Handle Instant Meeting Launch
   const handleLaunchInstantMeeting = async () => {
@@ -137,13 +185,29 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
   const handleScheduleMeeting = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newTitle.trim() || !newDate || !user) return;
+
+    if (!isSupabaseConfigured()) {
+      alert(
+        'Supabase is not configured. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env (or use Database Setup in the banner), then run the migration.'
+      );
+      return;
+    }
+
+    if (!organization?.id) {
+      alert(
+        'Your account is not linked to an organization yet, so the meeting cannot be saved. ' +
+          'This usually means the organization_memberships row is missing for your user.'
+      );
+      return;
+    }
+
     setIsSubmitting(true);
 
     try {
       const slug = newTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').substring(0, 20) + '-' + Math.random().toString(36).substring(2, 6);
       const roomName = 'samteck-' + slug;
       const startDateTime = new Date(`${newDate}T${newTime}:00`).toISOString();
-      const orgId = organization?.id || '00000000-0000-0000-0000-000000000000';
+      const orgId = organization.id;
 
       const { data, error } = await supabase
         .from('meetings')
@@ -174,9 +238,51 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
       }
     } catch (err) {
       console.error('Error creating meeting:', err);
-      alert('Failed to schedule meeting: ' + (err instanceof Error ? err.message : 'Unknown error'));
+      const msg = getErrorMessage(err, 'Unknown error');
+      const details =
+        err && typeof err === 'object' && 'details' in err && (err as { details?: string }).details
+          ? ` (${(err as { details: string }).details})`
+          : '';
+      alert('Failed to schedule meeting: ' + msg + details);
     } finally {
       setIsSubmitting(false);
+    }
+  };
+
+  // Delete an upcoming session. Super-admin only, enforced server-side by RLS.
+  const handleDeleteMeeting = async () => {
+    const target = confirmDelete;
+    if (!target) return;
+
+    setDeletingId(target.id);
+    setDeleteError(null);
+
+    try {
+      const { error } = await supabase.from('meetings').delete().eq('id', target.id);
+      if (error) throw error;
+
+      // Remove locally right away; the realtime subscription keeps other
+      // clients in sync.
+      setMeetings((prev) => prev.filter((m) => m.id !== target.id));
+      setConfirmDelete(null);
+
+      await supabase.from('audit_logs').insert({
+        user_id: user?.id || null,
+        user_email: user?.email || null,
+        action: 'MEETING_DELETED',
+        target_entity: 'meetings',
+        target_id: target.id,
+        details: { title: target.title, slug: target.slug, start_time: target.start_time },
+      });
+    } catch (err: unknown) {
+      const msg = getErrorMessage(err, 'Unknown error');
+      setDeleteError(
+        msg.toLowerCase().includes('permission') || msg.toLowerCase().includes('row-level')
+          ? 'You do not have permission to delete sessions. Only a Super Administrator can do this.'
+          : `Failed to delete session: ${msg}`
+      );
+    } finally {
+      setDeletingId(null);
     }
   };
 
@@ -321,6 +427,25 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
                       <Video className="w-3.5 h-3.5" />
                       <span>Join Room</span>
                     </button>
+
+                    {canDeleteMeeting && (
+                      <button
+                        onClick={() => {
+                          setDeleteError(null);
+                          setConfirmDelete(meeting);
+                        }}
+                        disabled={deletingId === meeting.id}
+                        aria-label={`Delete ${meeting.title}`}
+                        title="Delete session"
+                        className="px-2.5 py-2 bg-white border border-red-200 text-red-600 hover:bg-red-50 hover:border-red-300 text-xs font-bold rounded-lg transition shadow-xs flex items-center gap-1.5 disabled:opacity-50"
+                      >
+                        {deletingId === meeting.id ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
@@ -494,6 +619,63 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* DELETE CONFIRMATION MODAL */}
+      {confirmDelete && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-xl max-w-md w-full p-6 shadow-xl border border-[#DCE5F0] space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-red-50 rounded-lg border border-red-200">
+                <Trash2 className="w-5 h-5 text-red-600" />
+              </div>
+              <h2 className="text-base font-bold text-[#172B4D]">Delete Session</h2>
+            </div>
+
+            <p className="text-xs text-[#65758B]">
+              Permanently delete <span className="font-semibold text-[#172B4D]">"{confirmDelete.title}"</span>?
+              This removes it for everyone in the workspace and cannot be undone.
+            </p>
+
+            {deleteError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700">
+                {deleteError}
+              </div>
+            )}
+
+            <div className="pt-2 flex justify-end gap-2 border-t border-[#DCE5F0]">
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmDelete(null);
+                  setDeleteError(null);
+                }}
+                disabled={deletingId === confirmDelete.id}
+                className="px-4 py-2 border border-[#DCE5F0] text-xs font-semibold rounded-lg hover:bg-slate-50 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleDeleteMeeting}
+                disabled={deletingId === confirmDelete.id}
+                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-semibold rounded-lg transition flex items-center gap-1.5 disabled:opacity-50"
+              >
+                {deletingId === confirmDelete.id ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    Deleting...
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Delete Session
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         </div>
       )}

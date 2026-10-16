@@ -60,9 +60,21 @@ export type SystemAction =
   | 'invite_members'
   | 'create_project'
   | 'manage_meeting'
+  | 'delete_meeting'
   | 'review_idea'
   | 'access_finance'
-  | 'view_audit_logs';
+  | 'view_audit_logs'
+  | 'access_admin_portal'
+  | 'publish_announcement'
+  | 'manage_learning';
+
+/** Roles that carry leadership / administrative authority. */
+const LEADERSHIP_ROLES: UserRole[] = [
+  'super_admin',
+  'team_leader',
+  'assistant_leader',
+  'department_lead',
+];
 
 export function checkRolePermission(role: UserRole | undefined, action: SystemAction): boolean {
   if (!role) return false;
@@ -70,7 +82,11 @@ export function checkRolePermission(role: UserRole | undefined, action: SystemAc
   switch (action) {
     case 'manage_system':
     case 'view_audit_logs':
+    case 'delete_meeting':
       return role === 'super_admin';
+
+    case 'access_admin_portal':
+      return role === 'super_admin' || role === 'team_leader';
 
     case 'invite_members':
       return ['super_admin', 'team_leader', 'assistant_leader'].includes(role);
@@ -82,7 +98,11 @@ export function checkRolePermission(role: UserRole | undefined, action: SystemAc
       return ['super_admin', 'team_leader', 'assistant_leader', 'project_manager', 'department_lead', 'team_member'].includes(role);
 
     case 'review_idea':
+    case 'publish_announcement':
       return ['super_admin', 'team_leader', 'assistant_leader', 'department_lead'].includes(role);
+
+    case 'manage_learning':
+      return ['super_admin', 'team_leader', 'department_lead'].includes(role);
 
     case 'access_finance':
       return ['super_admin', 'team_leader'].includes(role);
@@ -90,6 +110,11 @@ export function checkRolePermission(role: UserRole | undefined, action: SystemAc
     default:
       return false;
   }
+}
+
+/** True when the role sits above ordinary membership in the hierarchy. */
+export function isLeadershipRole(role: UserRole | undefined): boolean {
+  return Boolean(role) && LEADERSHIP_ROLES.includes(role as UserRole);
 }
 
 /**

@@ -283,6 +283,18 @@ export interface LearningAssignment {
   created_at: string;
 }
 
+/** A member's own progress against a resource or learning path. */
+export interface LearningProgress {
+  id: string;
+  user_id: string;
+  resource_id?: string | null;
+  path_id?: string | null;
+  progress_percent: number;
+  is_completed: boolean;
+  completed_at?: string | null;
+  updated_at?: string;
+}
+
 export interface Announcement {
   id: string;
   organization_id: string;
