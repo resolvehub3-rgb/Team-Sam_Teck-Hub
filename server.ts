@@ -190,6 +190,24 @@ app.get('/api/health', async (_req: Request, res: Response) => {
     configIssues.push('The Supabase admin client could not be created; check the server logs.');
   }
 
+  // APP_URL builds every invitation link. Unset, it falls back to
+  // http://localhost:3000, which produces links a recipient cannot open - and
+  // nothing else surfaces that, since the invitation is still created and the
+  // email may still send. Flag it whenever this runs anywhere but local
+  // development, because the failure is otherwise invisible until someone
+  // clicks the link.
+  if (!process.env.APP_URL) {
+    configIssues.push(
+      process.env.VERCEL
+        ? 'APP_URL is not set. Invitation links will point at http://localhost:3000 and cannot be opened. Set it to your deployed origin, e.g. https://your-app.vercel.app.'
+        : 'APP_URL is not set, so invitation links fall back to http://localhost:3000.'
+    );
+  } else if (/^https?:\/\/(localhost|127\.0\.0\.1)(:|$)/i.test(process.env.APP_URL)) {
+    configIssues.push(
+      'APP_URL points at localhost, so invitation links cannot be opened from another machine.'
+    );
+  }
+
   const isLivekitConfigured = Boolean(
     process.env.LIVEKIT_URL &&
     process.env.LIVEKIT_API_KEY &&
