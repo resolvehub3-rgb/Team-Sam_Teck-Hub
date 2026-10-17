@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import type { UserRole } from '../types/database.ts';
 import {
   WORKSPACES,
   MEMBER_TABS,
@@ -26,7 +27,7 @@ test('ordinary members only ever get the Member Workspace', () => {
 test('leadership and administration access follows the role hierarchy', () => {
   assert.equal(canAccessWorkspace('super_admin', 'admin'), true);
   assert.equal(canAccessWorkspace('super_admin', 'leadership'), true);
-  assert.equal(canAccessWorkspace('team_leader', 'admin'), true);
+  assert.equal(canAccessWorkspace('team_leader', 'admin'), false);
   assert.equal(canAccessWorkspace('project_manager', 'leadership'), false);
   assert.equal(canAccessWorkspace('project_manager', 'admin'), false);
   assert.equal(canAccessWorkspace(undefined, 'workspace'), false);
@@ -50,8 +51,28 @@ test('members cannot reach administrative sections by editing the URL', () => {
   assert.equal(canAccessTab('workspace', 'reports', 'team_member'), false);
   // The Administration entry stays hidden for non-privileged shell users too.
   assert.equal(canAccessTab('leadership', 'admin', 'assistant_leader'), false);
-  assert.equal(canAccessTab('leadership', 'admin', 'team_leader'), true);
+  assert.equal(canAccessTab('leadership', 'admin', 'team_leader'), false);
   assert.equal(canAccessTab('admin', 'admin', 'super_admin'), true);
+});
+
+test('the Administration Portal is Super Administrator only', () => {
+  // Every other role is refused the workspace outright, so an invited
+  // Team Leader can neither see the entry nor reach it by editing the URL.
+  const others: UserRole[] = [
+    'team_leader',
+    'assistant_leader',
+    'project_manager',
+    'department_lead',
+    'team_member',
+    'guest',
+  ];
+  for (const r of others) {
+    assert.equal(canAccessWorkspace(r, 'admin'), false, `${r} must not enter admin`);
+    assert.equal(canAccessTab('admin', 'admin', r), false, `${r} must not open the admin tab`);
+  }
+  assert.equal(canAccessWorkspace('super_admin', 'admin'), true);
+  assert.equal(canAccessTab('admin', 'admin', 'super_admin'), true);
+  assert.deepEqual(workspacesForRole('team_leader'), ['leadership', 'manager', 'workspace']);
 });
 
 test('member workspace exposes exactly the eleven required sections', () => {

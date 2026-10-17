@@ -139,7 +139,13 @@ export const TAB_LABELS: Record<NavigationTab, string> = {
   help: 'Help & Support',
 };
 
-const ADMIN_ROLES: UserRole[] = ['super_admin', 'team_leader'];
+/**
+ * The Administration Portal is reserved for the Super Administrator alone.
+ * No other role — including Team Leader — may enter it. This constant is the
+ * single source of truth: `allowedTabs` hides the navigation entry and
+ * `canAccessTab` refuses the route, so typing the URL gains nothing.
+ */
+const ADMIN_ROLES: UserRole[] = ['super_admin'];
 
 /**
  * Which workspaces the signed-in role may enter.
@@ -151,7 +157,10 @@ export function workspacesForRole(role: UserRole | null | undefined): WorkspaceI
     case 'super_admin':
       return ['admin', 'leadership', 'manager', 'workspace'];
     case 'team_leader':
-      return ['leadership', 'admin', 'manager', 'workspace'];
+      // The Administration Portal is Super Administrator only, so a Team
+      // Leader keeps leadership, manager and their own workspace but not
+      // 'admin' — even though they outrank every other inviteable role.
+      return ['leadership', 'manager', 'workspace'];
     case 'assistant_leader':
       return ['leadership', 'manager', 'workspace'];
     case 'project_manager':
