@@ -1433,13 +1433,33 @@ app.post('/api/invitations', requireAuth, async (req: AuthedRequest, res: Respon
           /already/i.test(msg);
 
         if (alreadyExists) {
-          // GoTrue refuses to re-send an invite to a registered address, so
-          // no email goes out. Record the account so acceptance can attach
-          // the membership, and be honest that delivery did not happen.
+          // GoTrue refuses to re-invite a registered address, so the invite
+          // email cannot be sent. Fall back to a magic link, which Supabase
+          // does deliver to an existing user - verified: generateLink with
+          // type "invite" fails here with "already been registered", while
+          // type "magiclink" succeeds and returns a link. It signs the
+          // recipient in and returns them to the invite URL, where acceptance
+          // attaches the membership by email lookup.
           accountPreExisted = true;
           authUserId = await findUserIdByEmail(normalizedEmail);
-          emailSent = false;
-          emailProviderError = 'This address already has an account, so no invite email was sent.';
+          try {
+            const { error: magicErr } = await supabaseAdmin.auth.admin.generateLink({
+              type: 'magiclink',
+              email: normalizedEmail,
+              options: { redirectTo: inviteUrl },
+            });
+            if (magicErr) {
+              emailSent = false;
+              emailProviderError = magicErr.message || 'Email delivery failed';
+            } else {
+              emailSent = true;
+              emailProviderError = null;
+            }
+          } catch (magicException) {
+            emailSent = false;
+            emailProviderError =
+              magicException instanceof Error ? magicException.message : 'Email delivery failed';
+          }
         } else {
           emailProviderError = msg || 'Email delivery failed';
         }
