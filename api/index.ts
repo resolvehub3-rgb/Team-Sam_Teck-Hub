@@ -15,6 +15,13 @@
 //
 // The `/api/*` rewrite in vercel.json routes API traffic here; everything else
 // falls through to the static build.
-import app from '../server';
+// The `.js` extension is required, not cosmetic. Vercel runs this project as
+// native ESM (package.json declares "type": "module") and emits server.ts to
+// server.js. ESM performs no extension resolution, so the extensionless form
+// `../server` asks the loader for a file literally named "server" and fails
+// with ERR_MODULE_NOT_FOUND at module load. That single unresolved import took
+// down every endpoint re-exporting this app, surfacing as a bare
+// FUNCTION_INVOCATION_FAILED with no stack.
+import app from '../server.js';
 
 export default app;
