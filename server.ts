@@ -9,8 +9,23 @@ import { validateFirstTimeSetupPayload } from './src/utils/rules.ts';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Directory of this module, used only when serving the built frontend from
+// disk (see startServer below) - a path Vercel never takes, since the CDN
+// serves dist/ and this file runs purely as an API function.
+//
+// `import.meta.url` is undefined when a bundler compiles this file to
+// CommonJS, and fileURLToPath(undefined) throws at module load, which would
+// take down every route before any handler registers. Deriving it defensively
+// keeps the module importable in both formats.
+const moduleDir = (() => {
+  try {
+    const metaUrl = import.meta.url;
+    return metaUrl ? path.dirname(fileURLToPath(metaUrl)) : process.cwd();
+  } catch {
+    return process.cwd();
+  }
+})();
+const __dirname = moduleDir;
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -215,6 +230,24 @@ app.post('/api/setup/initialize-admin', async (req: Request, res: Response) => {
       });
     }
 
+    // The in-memory flag above is per-instance and starts optimistic, so it is
+    // not authoritative on its own. Confirm against the database that no super
+    // administrator exists yet; otherwise a warm instance, or a direct call to
+    // this route, could provision a second one.
+    if (supabaseAdmin) {
+      const { count } = await supabaseAdmin
+        .from('organization_memberships')
+        .select('*', { count: 'exact', head: true })
+        .eq('role', 'super_admin');
+
+      if (count && count > 0) {
+        hasProvisionedInitialAdmin = true;
+        return res.status(403).json({
+          error: 'Initial administrator has already been provisioned. First-time setup is closed.',
+        });
+      }
+    }
+
     const { email, password, fullName, organizationName, setupSecret } = req.body;
     const expectedSecret = process.env.SETUP_PROVISIONING_SECRET;
 
@@ -354,6 +387,14 @@ app.post('/api/setup/initialize-admin', async (req: Request, res: Response) => {
         },
       });
       if (auditErr) warnings.push(`Audit entry not written: ${auditErr.message}`);
+    } else {
+      // No database client means nothing above was created. Reporting success
+      // here would tell the operator an administrator exists when it does not,
+      // and the setup screen would reappear on the next launch anyway.
+      return res.status(503).json({
+        error:
+          'Server storage is not configured, so no administrator account could be created. Set SUPABASE_SERVICE_ROLE_KEY and VITE_SUPABASE_URL, then try again.',
+      });
     }
 
     hasProvisionedInitialAdmin = true;
@@ -1616,19 +1657,28 @@ app.post('/api/invitations/:token/accept', async (req: Request, res: Response) =
   }
 });
 
-// Start Express server and mount Vite middleware
-async function startServer() {
-  if (!isProduction) {
-    // Imported lazily: `vite` is a build-time dependency and pulling it into
-    // the module graph would drag the whole bundler into the serverless
-    // function bundle on Vercel.
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
+// Exported for two callers that own the listener lifecycle:
+//   * api/index.ts - the Vercel serverless entry, invoked per request.
+//   * dev-server.ts - local development, which mounts Vite middleware first.
+// Importing this file must never bind a port itself, so that is gated below.
+export default app;
+
+// Bind a port only when this file is the program actually being run (npm
+// start, serving the built frontend from disk). `import.meta` is emptied when
+// a bundler compiles this to CommonJS, so the comparison is wrapped and
+// treated as "not the entry point" if it cannot be evaluated.
+const isDirectRun = (() => {
+  try {
+    const entry = process.argv[1];
+    if (!entry || !import.meta.url) return false;
+    return path.resolve(entry) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+})();
+
+if (isDirectRun) {
+  if (isProduction) {
     app.use(express.static(path.resolve(__dirname, 'dist')));
     app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
@@ -1637,20 +1687,5 @@ async function startServer() {
 
   app.listen(PORT, 'localhost', () => {
     console.log(`[Sam_Teck Hub] Server active on http://localhost:${PORT}`);
-  });
-}
-
-// `app` is the whole API surface. Exporting it lets Vercel mount it as a
-// serverless function (see api/index.ts) instead of binding a port, which a
-// serverless runtime has no use for. The `listen()` path below stays for local
-// development and any self-hosted deployment.
-export default app;
-
-const isServerless = Boolean(process.env.VERCEL);
-
-if (!isServerless) {
-  startServer().catch((err) => {
-    console.error('[Sam_Teck Hub] Failed to start server:', err);
-    process.exit(1);
   });
 }

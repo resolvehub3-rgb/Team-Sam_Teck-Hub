@@ -35,9 +35,25 @@ export const FirstTimeSetupView: React.FC<FirstTimeSetupViewProps> = ({ onSetupS
         }),
       });
 
-      const data = await res.json();
+      // Read as text first, then parse. A gateway or platform failure returns
+      // plain text rather than JSON, and calling res.json() on it would throw
+      // a confusing parse error instead of reporting what actually went wrong.
+      const raw = await res.text();
+      let data: { error?: string } = {};
+      try {
+        data = raw ? (JSON.parse(raw) as { error?: string }) : {};
+      } catch {
+        data = {};
+      }
+
       if (!res.ok) {
-        throw new Error(data.error || 'Initial provisioning failed');
+        throw new Error(
+          data.error ||
+            `Provisioning failed (HTTP ${res.status}). The server may be starting up or temporarily unavailable - try again in a moment.`
+        );
+      }
+      if (!raw) {
+        throw new Error('The server returned an empty response. Please try again.');
       }
 
       setSuccess(true);
