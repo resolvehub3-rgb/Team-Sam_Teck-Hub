@@ -85,8 +85,18 @@ export const InviteAcceptView: React.FC<InviteAcceptViewProps> = ({ token, onAcc
   };
 
   return (
-    <div className="min-h-screen bg-[#F5F8FC] flex items-center justify-center p-4">
-      <div className="max-w-md w-full bg-white rounded-2xl shadow-xl border border-[#DCE5F0] overflow-hidden">
+    <div className="relative min-h-screen flex items-center justify-center p-4 bg-[#0B1F3A]">
+      {/* Background photograph, shown behind a solid overlay so the white card
+          and its text keep contrast whatever the image contains. The base
+          colour on the wrapper is the fallback if the file fails to load. */}
+      <div
+        aria-hidden="true"
+        className="absolute inset-0 bg-cover bg-center"
+        style={{ backgroundImage: "url('/invite-bg.jpg')" }}
+      />
+      <div aria-hidden="true" className="absolute inset-0 bg-[#0B1F3A]/70" />
+
+      <div className="relative z-10 max-w-md w-full bg-white rounded-2xl shadow-xl border border-[#DCE5F0] overflow-hidden">
         {/* Brand header */}
         <div className="bg-[#123B73] text-white p-6 sm:p-8 text-center border-b border-[#0B1F3A]">
           <div className="flex items-center justify-center gap-2 mb-1">
