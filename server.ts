@@ -2,7 +2,6 @@ import express, { Request, Response, NextFunction } from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import crypto from 'crypto';
-import { fileURLToPath } from 'url';
 import { createClient } from '@supabase/supabase-js';
 import { AccessToken } from 'livekit-server-sdk';
 import { validateFirstTimeSetupPayload } from './src/utils/rules.ts';
@@ -10,22 +9,17 @@ import { validateFirstTimeSetupPayload } from './src/utils/rules.ts';
 dotenv.config();
 
 // Directory of this module, used only when serving the built frontend from
-// disk (see startServer below) - a path Vercel never takes, since the CDN
-// serves dist/ and this file runs purely as an API function.
+// disk (see the isDirectRun block at the end of this file) - a path Vercel
+// never takes, since the CDN serves dist/ and this file runs purely as an API
+// function.
 //
-// `import.meta.url` is undefined when a bundler compiles this file to
-// CommonJS, and fileURLToPath(undefined) throws at module load, which would
-// take down every route before any handler registers. Deriving it defensively
-// keeps the module importable in both formats.
-const moduleDir = (() => {
-  try {
-    const metaUrl = import.meta.url;
-    return metaUrl ? path.dirname(fileURLToPath(metaUrl)) : process.cwd();
-  } catch {
-    return process.cwd();
-  }
-})();
-const __dirname = moduleDir;
+// Deliberately process.cwd() rather than import.meta.url. `pnpm start` runs
+// from the project root, so cwd is the directory containing dist/. Deriving
+// this from import.meta.url instead is a trap: when a bundler emits
+// CommonJS without rewriting it, Node throws a SyntaxError at *parse* time,
+// before any try/catch in this file can run, and the whole function dies with
+// a bare FUNCTION_INVOCATION_FAILED. process.cwd() is safe in both formats.
+const __dirname = process.cwd();
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -1718,19 +1712,25 @@ app.post('/api/invitations/:token/accept', async (req: Request, res: Response) =
 // Importing this file must never bind a port itself, so that is gated below.
 export default app;
 
-// Bind a port only when this file is the program actually being run (npm
-// start, serving the built frontend from disk). `import.meta` is emptied when
-// a bundler compiles this to CommonJS, so the comparison is wrapped and
-// treated as "not the entry point" if it cannot be evaluated.
-const isDirectRun = (() => {
+// Bind a port only when this file is the program actually being run
+// (`pnpm start`, serving the built frontend from disk). Importing this module
+// - by the Vercel entry (api/index.ts) or the dev bootstrap (dev-server.ts) -
+// must never bind a port, because the caller owns that lifecycle.
+//
+// Compared by filename rather than by import.meta.url. As above, `import.meta`
+// can become a parse-time SyntaxError under a CommonJS bundler, which no
+// try/catch here could recover from, and the filename answers the same
+// question without that risk.
+const entryFile = (() => {
   try {
-    const entry = process.argv[1];
-    if (!entry || !import.meta.url) return false;
-    return path.resolve(entry) === fileURLToPath(import.meta.url);
+    const entry = process.argv[1] || '';
+    return path.basename(entry).toLowerCase();
   } catch {
-    return false;
+    return '';
   }
 })();
+
+const isDirectRun = entryFile === 'server.ts' || entryFile === 'server.js';
 
 if (isDirectRun) {
   if (isProduction) {
