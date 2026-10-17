@@ -4,7 +4,6 @@ import path from 'path';
 import crypto from 'crypto';
 import { createClient } from '@supabase/supabase-js';
 import { AccessToken } from 'livekit-server-sdk';
-import { validateFirstTimeSetupPayload } from './src/utils/rules';
 
 dotenv.config();
 
@@ -269,6 +268,48 @@ app.get('/api/setup/status', async (_req: Request, res: Response) => {
     secretConfigured: Boolean(process.env.SETUP_PROVISIONING_SECRET),
   });
 });
+
+// Validate the first-time setup payload.
+//
+// This is deliberately a local copy rather than an import of the identically
+// named helper in src/utils/rules.ts. That file lives under src/, and
+// importing across that boundary made the serverless function depend on a
+// relative module that Vercel's Node runtime resolves differently depending on
+// whether it emits CommonJS or ESM - a distinction that depends on package.json
+// "type" and "engines", and which took the whole function down at load time with
+// no outgoing request and no stack trace. Keeping this copy here means the
+// server function depends on nothing outside node_modules, which Vercel traces
+// reliably in either module format.
+//
+// It is also the correct place for the check: the server must validate its own
+// input rather than trust a rule shared with the client.
+function validateFirstTimeSetupPayload(
+  payload: {
+    email?: string;
+    password?: string;
+    fullName?: string;
+    organizationName?: string;
+    setupSecret?: string;
+  },
+  expectedSecret?: string
+): { isValid: boolean; error?: string } {
+  if (!payload.email || !payload.email.includes('@')) {
+    return { isValid: false, error: 'A valid email address is required' };
+  }
+  if (!payload.password || payload.password.length < 8) {
+    return { isValid: false, error: 'Password must be at least 8 characters long' };
+  }
+  if (!payload.fullName || payload.fullName.trim().length < 2) {
+    return { isValid: false, error: 'Full name is required' };
+  }
+  if (!payload.organizationName || payload.organizationName.trim().length < 2) {
+    return { isValid: false, error: 'Workspace organization name is required' };
+  }
+  if (expectedSecret && payload.setupSecret !== expectedSecret) {
+    return { isValid: false, error: 'Invalid first-time setup provisioning secret' };
+  }
+  return { isValid: true };
+}
 
 // 3. FIRST-TIME INITIAL ADMINISTRATOR PROVISIONING
 app.post('/api/setup/initialize-admin', async (req: Request, res: Response) => {
