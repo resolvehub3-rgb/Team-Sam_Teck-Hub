@@ -47,15 +47,33 @@ export default async function handler(
   // rather than a bare FUNCTION_INVOCATION_FAILED with no stack.
   try {
     await import('../server');
-    results['../server (full module)'] = 'OK - server.ts loaded';
+    results['../server (no extension)'] = 'OK';
   } catch (err) {
     const e = err as Error & { code?: string };
-    results['../server (full module)'] = `FAILED${e.code ? ` [${e.code}]` : ''}: ${e.message}`;
+    results['../server (no extension)'] = `FAILED${e.code ? ` [${e.code}]` : ''}: ${e.message}`;
+  }
+
+  for (const spec of ['../server.js', '../server.ts']) {
+    try {
+      await import(spec);
+      results[spec] = 'OK - RESOLVES';
+    } catch (err) {
+      const e = err as Error & { code?: string };
+      results[spec] = `FAILED${e.code ? ` [${e.code}]` : ''}: ${e.message}`;
+    }
+  }
+
+  // Which files actually exist in the task directory? Decides whether the
+  // compiled output is .js or .ts, and therefore which specifier is correct.
+  try {
+    const fs = await import('node:fs');
+    results['fs /var/task listing'] = JSON.stringify(fs.readdirSync('/var/task').filter((f: string) => f.includes('server')));
+  } catch (err) {
+    results['fs /var/task listing'] = `FAILED: ${(err as Error).message}`;
   }
 
   res.status(200).json({
     node: process.version,
-    type: (globalThis as { process?: { getBuiltinModule?: unknown } }).process ? 'running' : 'unknown',
     results,
   });
 }
