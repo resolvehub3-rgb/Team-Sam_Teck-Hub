@@ -33,15 +33,47 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 app.use(express.json());
 
-// Initialize Supabase Admin Client if service key is provided
-const supabaseUrl = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-const supabaseAnonKey = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
+// Initialize Supabase Admin Client if service key is provided.
+//
+// createClient validates the URL and *throws* on a malformed one (for example
+// a project host pasted without its https:// scheme). That would kill the
+// whole function at module load, taking every unrelated route down with it and
+// surfacing as a bare platform 500 with no body to explain it. Degrading to a
+// null client instead means the routes can still answer, and /api/health
+// names the misconfiguration directly.
+const readEnv = (name: string) => {
+  const raw = process.env[name];
+  if (!raw) return '';
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  if (name.endsWith('_URL') && trimmed && !/^https?:\/\//i.test(trimmed)) {
+    console.error(
+      `[Sam_Teck Hub] ${name} is missing its http(s):// scheme (got "${trimmed}"). ` +
+        'Set it to the full URL, e.g. https://your-project.supabase.co'
+    );
+    return '';
+  }
+  return trimmed;
+};
+
+const supabaseUrl = readEnv('VITE_SUPABASE_URL') || readEnv('SUPABASE_URL');
+const supabaseServiceKey = readEnv('SUPABASE_SERVICE_ROLE_KEY');
+const supabaseAnonKey = readEnv('VITE_SUPABASE_ANON_KEY') || readEnv('SUPABASE_ANON_KEY');
 
 const supabaseAdmin = (supabaseUrl && supabaseServiceKey)
-  ? createClient(supabaseUrl, supabaseServiceKey, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    })
+  ? (() => {
+      try {
+        return createClient(supabaseUrl, supabaseServiceKey, {
+          auth: { autoRefreshToken: false, persistSession: false },
+        });
+      } catch (err) {
+        console.error(
+          '[Sam_Teck Hub] Supabase admin client could not be created:',
+          err instanceof Error ? err.message : err
+        );
+        return null;
+      }
+    })()
   : null;
 
 // Authoritative in-memory state for provisioned admin
@@ -143,6 +175,28 @@ const MEETING_LEAD_ROLES = new Set([
 // 1. HEALTH & SERVICE INTEGRATION CHECK
 app.get('/api/health', async (_req: Request, res: Response) => {
   const isSupabaseConfigured = Boolean(supabaseUrl && (supabaseAnonKey || supabaseServiceKey));
+
+  // Surface misconfiguration in plain text rather than letting it surface as an
+  // opaque 500 on some other route. A single curl of this endpoint then
+  // explains what is wrong with the deployment.
+  const configIssues: string[] = [];
+  if (!process.env.VITE_SUPABASE_URL && !process.env.SUPABASE_URL) {
+    configIssues.push('VITE_SUPABASE_URL is not set.');
+  } else if (!supabaseUrl) {
+    configIssues.push(
+      'VITE_SUPABASE_URL is set but unusable - it must include the https:// scheme, e.g. https://your-project.supabase.co'
+    );
+  }
+  if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    configIssues.push('SUPABASE_SERVICE_ROLE_KEY is not set, so privileged server routes cannot run.');
+  }
+  if (!process.env.VITE_SUPABASE_ANON_KEY && !process.env.SUPABASE_ANON_KEY) {
+    configIssues.push('VITE_SUPABASE_ANON_KEY is not set, so the browser cannot reach Supabase.');
+  }
+  if (!supabaseAdmin && supabaseUrl && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+    configIssues.push('The Supabase admin client could not be created; check the server logs.');
+  }
+
   const isLivekitConfigured = Boolean(
     process.env.LIVEKIT_URL &&
     process.env.LIVEKIT_API_KEY &&
@@ -164,6 +218,7 @@ app.get('/api/health', async (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
+    configIssues,
     database: {
       configured: isSupabaseConfigured,
       reachable: dbReachable,

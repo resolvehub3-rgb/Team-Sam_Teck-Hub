@@ -40,16 +40,22 @@ export const FirstTimeSetupView: React.FC<FirstTimeSetupViewProps> = ({ onSetupS
       // a confusing parse error instead of reporting what actually went wrong.
       const raw = await res.text();
       let data: { error?: string } = {};
+      let parsed = true;
       try {
         data = raw ? (JSON.parse(raw) as { error?: string }) : {};
       } catch {
+        parsed = false;
         data = {};
       }
 
       if (!res.ok) {
+        // When the body is not JSON it came from the platform rather than from
+        // an application handler, so include it verbatim - it is the only
+        // clue to what the serverless function actually did.
+        const detail = !parsed && raw ? ` Server response: ${raw.slice(0, 300)}` : '';
         throw new Error(
-          data.error ||
-            `Provisioning failed (HTTP ${res.status}). The server may be starting up or temporarily unavailable - try again in a moment.`
+          (data.error ||
+            `Provisioning failed (HTTP ${res.status}). The server may be starting up or temporarily unavailable - try again in a moment.`) + detail
         );
       }
       if (!raw) {
