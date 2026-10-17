@@ -4,9 +4,10 @@ import { useAuth } from '../context/AuthContext';
 
 interface FirstTimeSetupViewProps {
   onSetupSuccess: () => void;
+  onGoToLogin?: () => void;
 }
 
-export const FirstTimeSetupView: React.FC<FirstTimeSetupViewProps> = ({ onSetupSuccess }) => {
+export const FirstTimeSetupView: React.FC<FirstTimeSetupViewProps> = ({ onSetupSuccess, onGoToLogin }) => {
   const { signIn, refreshAuth } = useAuth();
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
@@ -237,6 +238,22 @@ export const FirstTimeSetupView: React.FC<FirstTimeSetupViewProps> = ({ onSetupS
             </button>
           </div>
         </form>
+
+        {/* Escape hatch. This screen is a mandatory full-screen gate, so it
+            must always offer a route to sign-in. An operator who already holds
+            an account should never be stranded here, whatever the reported
+            setup status. */}
+        {onGoToLogin && (
+          <div className="px-6 sm:px-8 pb-6 sm:pb-8 text-center">
+            <button
+              type="button"
+              onClick={onGoToLogin}
+              className="text-xs font-semibold text-[#2457A7] hover:text-[#123B73] underline underline-offset-2"
+            >
+              Already have an account? Sign in
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

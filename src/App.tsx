@@ -58,6 +58,10 @@ const AppContent: React.FC = () => {
   );
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [inSetupMode, setInSetupMode] = useState(false);
+  // Set when the operator dismisses the setup gate to reach sign-in. Without
+  // this, the auto-show condition below would immediately re-render the gate
+  // and strand them again.
+  const [setupDismissed, setSetupDismissed] = useState(false);
   const [deniedNoticeDismissed, setDeniedNoticeDismissed] = useState(false);
 
   useEffect(() => {
@@ -152,12 +156,21 @@ const AppContent: React.FC = () => {
   }
 
   // 1. Mandatory First-Time Administrator Setup Flow (Section 5)
-  if (inSetupMode || (!systemSetupStatus.initialAdminProvisioned && systemSetupStatus.canSetup && !user)) {
+  //
+  // Shown only when the server has positively confirmed that no initial
+  // administrator exists yet. A status check that failed or never resolved
+  // leaves canSetup false, so an unreachable status endpoint falls through to
+  // the login screen rather than trapping the visitor here.
+  if (inSetupMode || (!setupDismissed && !systemSetupStatus.initialAdminProvisioned && systemSetupStatus.canSetup && !user)) {
     return (
       <FirstTimeSetupView
         onSetupSuccess={async () => {
           setInSetupMode(false);
           await refreshAuth();
+        }}
+        onGoToLogin={() => {
+          setInSetupMode(false);
+          setSetupDismissed(true);
         }}
       />
     );

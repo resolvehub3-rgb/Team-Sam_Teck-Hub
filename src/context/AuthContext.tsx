@@ -39,10 +39,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [role, setRole] = useState<UserRole | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [roleLoaded, setRoleLoaded] = useState(false);
+  // canSetup must default to false, not true.
+  //
+  // App.tsx renders FirstTimeSetupView as a mandatory full-screen gate with no
+  // route to the login screen whenever `!initialAdminProvisioned && canSetup`.
+  // Defaulting to true therefore decides, before any request is made, that an
+  // unauthenticated visitor is trapped there. The fetch below only updated
+  // state on res.ok, so when the status endpoint was unreachable the default
+  // was never corrected and the visitor could not sign in at all.
+  //
+  // A failed check is the absence of evidence that setup is available, not
+  // evidence that it is. Falling back to the login screen is also the safe
+  // direction: login authenticates directly against Supabase and does not
+  // depend on this endpoint, whereas setup cannot succeed against a server
+  // that cannot answer this check in the first place.
   const [systemSetupStatus, setSystemSetupStatus] = useState({
     checked: false,
     initialAdminProvisioned: false,
-    canSetup: true,
+    canSetup: false,
   });
 
   const checkSetupStatus = async () => {
@@ -55,9 +69,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           initialAdminProvisioned: Boolean(data.initialAdminProvisioned),
           canSetup: Boolean(data.canSetup),
         });
+      } else {
+        // The server answered, but not successfully. Record that the check ran
+        // so the UI is not left in an indeterminate state. canSetup stays
+        // false, keeping the login screen reachable.
+        setSystemSetupStatus((prev) => ({ ...prev, checked: true }));
       }
     } catch (err) {
       console.warn('Setup status fetch error:', err);
+      // Unreachable. Leaving canSetup false keeps the login screen reachable.
+      setSystemSetupStatus((prev) => ({ ...prev, checked: true }));
     }
   };
 
