@@ -4,7 +4,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { createClient } from '@supabase/supabase-js';
 import { AccessToken } from 'livekit-server-sdk';
-import { validateFirstTimeSetupPayload } from './src/utils/rules.ts';
+import { validateFirstTimeSetupPayload } from './src/utils/rules';
 
 dotenv.config();
 
