@@ -330,6 +330,7 @@ EXECUTE FUNCTION public.protect_profile_identity();
 -- ====================================================================
 
 DROP POLICY IF EXISTS "Projects viewable by org members" ON public.projects;
+DROP POLICY IF EXISTS "Projects viewable by authorised users" ON public.projects;
 CREATE POLICY "Projects viewable by authorised users"
 ON public.projects FOR SELECT
 TO authenticated
@@ -358,6 +359,7 @@ USING (
 WITH CHECK (public.is_org_member(organization_id));
 
 DROP POLICY IF EXISTS "Project members viewable by org members" ON public.project_members;
+DROP POLICY IF EXISTS "Project members viewable by authorised users" ON public.project_members;
 CREATE POLICY "Project members viewable by authorised users"
 ON public.project_members FOR SELECT
 TO authenticated
@@ -384,6 +386,7 @@ TO authenticated
 USING (public.is_manager_or_above());
 
 DROP POLICY IF EXISTS "Milestones viewable by org members" ON public.milestones;
+DROP POLICY IF EXISTS "Milestones viewable by authorised users" ON public.milestones;
 CREATE POLICY "Milestones viewable by authorised users"
 ON public.milestones FOR SELECT
 TO authenticated
