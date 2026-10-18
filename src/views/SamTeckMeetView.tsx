@@ -166,25 +166,32 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
 
     if (orgId && isSupabaseConfigured()) {
       try {
-        const { data, error } = await supabase
-          .from('meetings')
-          .insert({
-            organization_id: orgId,
-            title: instantMeeting.title,
-            slug: instantMeeting.slug,
-            host_id: user.id,
-            start_time: instantMeeting.start_time,
-            duration_minutes: 60,
-            timezone: instantMeeting.timezone,
-            status: 'live',
-            livekit_room_name: roomName,
-          })
-          .select('*, host:profiles(*)')
-          .single();
+        // Split into insert + read-back: `INSERT ... RETURNING` (the combined
+        // `.insert().select().single()` form) is rejected by RLS here even
+        // though the insert alone succeeds. See handleScheduleMeeting.
+        const { error: insertErr } = await supabase.from('meetings').insert({
+          organization_id: orgId,
+          title: instantMeeting.title,
+          slug: instantMeeting.slug,
+          host_id: user.id,
+          start_time: instantMeeting.start_time,
+          duration_minutes: 60,
+          timezone: instantMeeting.timezone,
+          status: 'live',
+          livekit_room_name: roomName,
+        });
 
-        if (!error && data) {
-          setActiveMeeting(data as Meeting);
-          return;
+        if (!insertErr) {
+          const { data } = await supabase
+            .from('meetings')
+            .select('*, host:profiles(*)')
+            .eq('slug', instantMeeting.slug)
+            .single();
+
+          if (data) {
+            setActiveMeeting(data as Meeting);
+            return;
+          }
         }
       } catch (err) {
         console.warn('Could not persist instant meeting to DB:', err);
@@ -222,22 +229,35 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
       const startDateTime = new Date(`${newDate}T${newTime}:00`).toISOString();
       const orgId = organization.id;
 
+      // Insert and read-back are split into two calls on purpose.
+      //
+      // `INSERT ... RETURNING` (what `.insert().select().single()` produces)
+      // is rejected here with "new row violates row-level security policy
+      // for table meetings", even though the identical insert alone returns
+      // 201 and the identical select alone returns the row. Verified against
+      // the live database: plain INSERT -> 201, SELECT with the host join ->
+      // 200, but INSERT ... RETURNING -> 403. Doing them separately works.
+      const { error: insertErr } = await supabase.from('meetings').insert({
+        organization_id: orgId,
+        title: newTitle.trim(),
+        slug,
+        description: newDesc.trim() || null,
+        project_id: newProjectId || null,
+        host_id: user.id,
+        start_time: startDateTime,
+        duration_minutes: parseInt(newDuration, 10) || 45,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        status: 'scheduled',
+        livekit_room_name: roomName,
+      });
+
+      if (insertErr) throw insertErr;
+
+      // slug is UNIQUE, so this fetches exactly the row we just created.
       const { data, error } = await supabase
         .from('meetings')
-        .insert({
-          organization_id: orgId,
-          title: newTitle.trim(),
-          slug,
-          description: newDesc.trim() || null,
-          project_id: newProjectId || null,
-          host_id: user.id,
-          start_time: startDateTime,
-          duration_minutes: parseInt(newDuration, 10) || 45,
-          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-          status: 'scheduled',
-          livekit_room_name: roomName,
-        })
         .select('*, host:profiles(*), project:projects(*)')
+        .eq('slug', slug)
         .single();
 
       if (error) throw error;
