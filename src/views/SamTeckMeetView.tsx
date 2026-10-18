@@ -29,6 +29,12 @@ const getErrorMessage = (err: unknown, fallback: string): string => {
   return fallback;
 };
 
+// Placeholder for a meeting that only exists in memory (never persisted).
+// Any DB write must be gated on a real organization id first: the meetings
+// RLS policy rejects rows whose organization_id the caller is not a member
+// of, and a placeholder UUID matches no organization at all.
+const LOCAL_ONLY_ORG_ID = '00000000-0000-0000-0000-000000000000';
+
 interface SamTeckMeetViewProps {
   initialMeetingSlug?: string;
   onClearMeetingSlug?: () => void;
@@ -133,11 +139,18 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
     if (!user) return;
     const randomSlug = 'meet-' + Math.random().toString(36).substring(2, 9);
     const roomName = 'samteck-' + randomSlug;
-    const orgId = organization?.id || '00000000-0000-0000-0000-000000000000';
+    // Without a real organization the insert below is guaranteed to be
+    // rejected by the meetings RLS policy (is_org_member(organization_id)),
+    // so we skip the DB write entirely and run the session in memory. Never
+    // substitute a placeholder UUID here — a nil UUID matches no organization.
+    const orgId = organization?.id;
 
     const instantMeeting: Meeting = {
       id: 'local-' + Date.now(),
-      organization_id: orgId,
+      // Local-only fallback so the in-memory meeting still satisfies the
+      // required field. This value is never written to the database: the
+      // insert below is gated on a real `orgId`.
+      organization_id: orgId || LOCAL_ONLY_ORG_ID,
       title: 'Instant Collaboration Session',
       slug: randomSlug,
       host_id: user.id,
@@ -151,7 +164,7 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
       updated_at: new Date().toISOString(),
     };
 
-    if (isSupabaseConfigured()) {
+    if (orgId && isSupabaseConfigured()) {
       try {
         const { data, error } = await supabase
           .from('meetings')

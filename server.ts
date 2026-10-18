@@ -1259,36 +1259,113 @@ app.post('/api/documents/delete-file', requireAuth, async (req: AuthedRequest, r
 });
 
 // 7. AUTH LOGIN ROUTE
+//
+// This is a *fallback* for when Supabase Auth is unreachable. It must never
+// invent an identity the database cannot back, because the browser uses the
+// returned ids verbatim in RLS-checked writes.
+//
+// Two things were wrong with the earlier version and both surfaced as
+// "new row violates row-level security policy for table meetings":
+//
+//   1. It returned a hardcoded organization id that exists in no
+//      `organizations` row. The schedule form then inserted a meeting with
+//      that id, and the meetings INSERT policy
+//      (`is_org_member(organization_id) AND host_id = auth.uid()`) rejected
+//      it, because no membership can reference an organisation that does
+//      not exist.
+//   2. It matched on email only and never checked the password, so anyone
+//      who knew the address was handed a super_admin identity.
+//
+// The org id is now read from the caller's real membership row, and the
+// password is verified before anything is returned.
 app.post('/api/auth/login', async (req: Request, res: Response) => {
-  const { email } = req.body;
-  if (!email) {
-    return res.status(400).json({ error: 'Email is required' });
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required.' });
   }
 
-  if (initialAdminRecord && initialAdminRecord.email.toLowerCase() === email.toLowerCase()) {
-    return res.json({
-      success: true,
-      user: {
-        id: initialAdminRecord.id,
-        email: initialAdminRecord.email,
-        user_metadata: { full_name: initialAdminRecord.fullName },
-      },
-      profile: {
-        id: initialAdminRecord.id,
-        email: initialAdminRecord.email,
-        full_name: initialAdminRecord.fullName,
-        job_title: 'Founder & Super Administrator',
-      },
-      organization: {
-        id: '00000000-0000-0000-0000-000000000001',
-        name: initialAdminRecord.organizationName,
-        slug: initialAdminRecord.organizationName.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-      },
-      role: 'super_admin',
+  // Verify against Supabase Auth rather than an in-memory record. Without a
+  // verified session the client would write to Supabase as the `anon` role,
+  // which has no INSERT policy on `meetings` at all — so a meeting could
+  // never be saved no matter which organization id we returned here.
+  const admin = supabaseAdmin;
+  let userId: string | null = null;
+  let fullName = initialAdminRecord?.fullName || email;
+  if (admin) {
+    const { data: signInData, error: signInErr } = await admin.auth.signInWithPassword({
+      email,
+      password,
+    });
+    if (signInErr || !signInData?.user) {
+      return res.status(401).json({ error: 'Invalid credentials or user not found' });
+    }
+    userId = signInData.user.id;
+    fullName =
+      (signInData.user.user_metadata?.full_name as string | undefined) ||
+      initialAdminRecord?.fullName ||
+      email;
+  } else if (initialAdminRecord && initialAdminRecord.email.toLowerCase() === email.toLowerCase()) {
+    // No server-side Supabase client, so the id cannot be resolved or
+    // membership-checked. Refuse rather than hand back an unverifiable org.
+    return res.status(503).json({
+      error:
+        'Server authentication is not configured. Set SUPABASE_SERVICE_ROLE_KEY and VITE_SUPABASE_URL, then sign in again.',
+    });
+  } else {
+    return res.status(401).json({ error: 'Invalid credentials or user not found' });
+  }
+
+  // The organization id must come from a real, active membership row. A
+  // fabricated id here is exactly what broke meeting scheduling.
+  const { data: membership, error: membershipErr } = await admin
+    .from('organization_memberships')
+    .select('role, organization:organizations(id, name, slug)')
+    .eq('user_id', userId)
+    .eq('is_active', true)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (membershipErr || !membership) {
+    // Either the lookup failed or this account has no active membership.
+    // Returning a guessed organization here is what caused the meetings RLS
+    // failure, so refuse instead.
+    return res.status(403).json({
+      error:
+        'Your account is not linked to an organization yet, so it cannot be used to sign in. Ask an administrator to invite you to a workspace.',
     });
   }
 
-  return res.status(401).json({ error: 'Invalid credentials or user not found' });
+  // The embed is many-to-one, so PostgREST returns an object at runtime even
+  // though the generated type is an array. Normalise instead of casting.
+  const embedded = (membership as unknown as { organization: unknown }).organization;
+  const org = (Array.isArray(embedded) ? embedded[0] : embedded) as
+    | { id: string; name: string; slug: string }
+    | undefined;
+
+  if (!org?.id) {
+    return res.status(403).json({
+      error:
+        'Your account is not linked to an organization yet, so it cannot be used to sign in. Ask an administrator to invite you to a workspace.',
+    });
+  }
+
+  return res.json({
+    success: true,
+    user: {
+      id: userId,
+      email,
+      user_metadata: { full_name: fullName },
+    },
+    profile: {
+      id: userId,
+      email,
+      full_name: fullName,
+      job_title: 'Founder & Super Administrator',
+    },
+    organization: org,
+    role: membership.role,
+  });
 });
 
 // 8. MEMBER INVITATIONS: issue, deliver, and accept
