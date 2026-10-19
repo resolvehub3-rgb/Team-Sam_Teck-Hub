@@ -122,6 +122,55 @@ async function exchangeCode(code: string): Promise<TokenResponse> {
   return (await res.json().catch(() => ({}))) as TokenResponse;
 }
 
+/**
+ * Ask Google to validate the consent URL *before* we start waiting for a
+ * callback.
+ *
+ * When the redirect URI is not registered, Google renders an error page and
+ * never contacts localhost at all — so without this check the script hangs for
+ * the full timeout and reports nothing useful, which is exactly how it
+ * presented the redirect_uri_mismatch failure. Detecting it up front costs one
+ * request and turns a silent hang into an instruction the user can act on.
+ *
+ * A network failure here is not fatal: the flow still works offline-ish and
+ * the browser will show whatever Google says.
+ */
+async function preflightCheck(authUrl: string): Promise<void> {
+  let body = '';
+  try {
+    const res = await fetch(authUrl, { redirect: 'follow', signal: AbortSignal.timeout(15_000) });
+    body = await res.text();
+  } catch {
+    return;
+  }
+
+  if (body.includes('redirect_uri_mismatch')) {
+    console.error('\nGoogle rejected the redirect URI before we ever waited on it.');
+    console.error(`\n  ${redirectUri} is NOT registered on OAuth client:\n  ${clientId}\n`);
+    console.error('Fix one of these in Google Cloud console -> APIs & Services -> Credentials:');
+    console.error('  a) Open the client and ADD the URI above to "Authorised redirect URIs"'); 
+    console.error('     (required when the client type is "Web application"), or');
+    console.error('  b) Create a NEW credential of type "Desktop app" and put its client id');
+    console.error('     and secret into .env - desktop clients accept loopback automatically.');
+    console.error('\nThen re-run: pnpm google-meet:oauth');
+    process.exit(1);
+  }
+
+  if (body.includes('invalid_client')) {
+    console.error('\nGoogle reports invalid_client: the client id in .env is not recognised,');
+    console.error('or the Google Meet API is not enabled for its project.');
+    console.error('\nThen re-run: pnpm google-meet:oauth');
+    process.exit(1);
+  }
+
+  if (body.includes('admin_policy_enforced') || body.includes('access_blocked')) {
+    console.error('\nGoogle is blocking this client (admin policy or unverified app).');
+    console.error('Add your account as a Test user on the OAuth consent screen, and make sure');
+    console.error(`the scope ${SCOPE} is listed under Scopes.`);
+    process.exit(1);
+  }
+}
+
 async function main(): Promise<void> {
   // Random state, verified on the callback, so a stray request to our local
   // listener cannot be used to inject someone else's authorisation code.
@@ -137,6 +186,10 @@ async function main(): Promise<void> {
   authUrl.searchParams.set('access_type', 'offline');
   authUrl.searchParams.set('prompt', 'consent');
   authUrl.searchParams.set('state', state);
+
+  // Validate first: a bad redirect URI or missing scope is reported instantly
+  // instead of burning the full callback timeout with nothing to show for it.
+  await preflightCheck(authUrl.toString());
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url || '/', redirectUri);

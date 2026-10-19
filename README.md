@@ -13,7 +13,7 @@ A production-grade, unified SaaS platform for project and task management, team 
 - **Real Data Only**: Zero simulated mock data, zero fake users, and zero hardcoded dashboard numbers. All statistics are queried dynamically from real PostgreSQL records.
 - **First-Time Administrator Setup**: Server-guarded initialization flow that provisions the initial Super Administrator and primary workspace. Once complete, setup locks automatically.
 - **Role-Based Access Control (RBAC)**: Fine-grained permissions across 7 roles: Super Administrator, Team Leader / Founder, Assistant Team Leader, Project Manager, Department Lead, Team Member, and External Guest.
-- **Sam_Teck Meet**: Native branded virtual meetings with pre-join camera/mic checks, WebRTC audio/video/screensharing powered by LiveKit Cloud, in-meeting chat, and live meeting minutes with **one-click action-item to task conversion**.
+- **Sam_Teck Meet**: Schedule or launch real **Google Meet** sessions (spaces created server-side via the Google Meet REST API), with the join link opening in a new tab, plus meeting minutes, decisions and action items tracked in-app with their project-task status.
 - **Project & Task Management**: Interactive Kanban board (`Backlog`, `To Do`, `In Progress`, `In Review`, `Blocked`, `Done`), milestones, priorities, deadlines, and task assignment.
 - **Innovation Lab**: Idea proposal pipeline, structured leadership reviews, and direct conversion of approved proposals into project roadmaps.
 - **Learning & Professional Development**: Knowledge base, course modules, assignments, and skill mastery tracking.
@@ -31,11 +31,10 @@ A production-grade, unified SaaS platform for project and task management, team 
   - Tailwind CSS v4 with custom brand tokens
   - **Montserrat** font family for all typography
   - Lucide React icon library
-  - Native WebRTC media device capture
 - **Backend**:
   - Node.js + Express (`server.ts`) running on port 3000
   - Vite middlewares mounted in development (`tsx server.ts`)
-  - Server-side LiveKit AccessToken generator (`livekit-server-sdk`)
+  - Server-side Google Meet REST client (OAuth refresh-token exchange with in-memory access-token cache)
   - First-time setup provisioning and action-item conversion endpoints
 - **Database & Storage**:
   - Supabase PostgreSQL with 39 version-controlled relational entities
@@ -44,9 +43,10 @@ A production-grade, unified SaaS platform for project and task management, team 
   - Supabase Storage for project deliverables and meeting documents
   - Supabase Realtime for instant synchronization
 - **Virtual Meetings**:
-  - LiveKit Cloud WebRTC SFU infrastructure
-  - `livekit-server-sdk` for room-scoped tokens and permission validation
-  - `livekit-client` and `@livekit/components-react`
+  - Google Meet via the official Meet REST API (server-side space creation)
+  - Join hands off to `https://meet.google.com/` in a new tab — see §8 for why in-app embedding is not possible
+  - Least-privilege scope: `https://www.googleapis.com/auth/meetings.space.created`
+  - `src/lib/googleMeetCore.ts` (pure state model) + `src/lib/googleMeet.ts` (network layer)
 
 ---
 
@@ -108,11 +108,19 @@ APP_URL="http://localhost:3000"
 
 ## 5. Database Setup & Migrations
 
-The complete schema migration script is located at:
+The schema migration scripts are located at, **in order**:
 
 ```
 supabase/migrations/20261016000000_sam_teck_hub_schema.sql
+supabase/migrations/20261019000000_google_meet_integration.sql
 ```
+
+> **Both must be applied.** The second one adds the Google Meet columns
+> (`google_space_name`, `google_meeting_uri`, `google_sync_status`,
+> `google_last_error`, `google_synced_at`) and renames `livekit_room_name` to
+> `room_name`. Applying only the first leaves the app sending a column the
+> database does not have, which surfaces as:
+> `Could not find the 'livekit_room_name' column of 'meetings' in the schema cache`.
 
 ### Applying the Schema:
 
@@ -120,6 +128,7 @@ supabase/migrations/20261016000000_sam_teck_hub_schema.sql
 2. Navigate to the **SQL Editor**.
 3. Copy and paste the contents of `supabase/migrations/20261016000000_sam_teck_hub_schema.sql`.
 4. Click **Run**.
+5. Repeat for `supabase/migrations/20261019000000_google_meet_integration.sql`.
 5. All 39 tables, enums, triggers, foreign keys, and Row Level Security (RLS) policies will be provisioned.
 
 ---
@@ -184,23 +193,41 @@ npm start
 
 ## 8. Sam_Teck Meet: Virtual Meeting Workflow
 
-1. **Schedule or Instant Meeting**: Authorized members can schedule a meeting linked to a project/department, or launch an instant room (`/meet/:slug`).
-2. **Pre-Join Device Check**: Participants preview their local camera stream and toggle microphone/camera settings prior to entering the room.
-3. **Live Room Experience**:
-   - WebRTC encrypted audio and video.
-   - Screen sharing via browser display capture.
-   - Persistent in-meeting text chat stored in `meeting_chat_messages`.
-   - Live **Agenda & Minutes Drawer** to record decisions and follow-up action items.
-4. **Action-Item to Task Conversion**:
-   - In the minutes drawer, click **"Convert to Real Task →"**.
-   - The backend creates a real task in the associated project (`tasks` table) and links the action item record.
+1. **Schedule or Instant Meeting**: Authorized members schedule a meeting linked to a project/department, or open one directly at `/meet/:slug`.
+2. **Google Meet provisioning**: On creation, the server calls the Google Meet REST API to create a space. Only meeting hosts/leadership can do this (`MEETING_LEAD_ROLES`), and only once — the result is stored on the `meetings` row in `google_meeting_uri`, so repeated requests never create a second space.
+3. **Join**: The **Join** button opens the stored `https://meet.google.com/...` link in a new tab. Sam_Teck Hub performs no in-app video, has no pre-join device check, and never requests camera or microphone access.
+4. **Meeting details**: Decisions, minutes and action items stay in Sam_Teck Hub in the meeting details panel, independent of Google Meet.
+   - Each action item shows whether it has been promoted to a project task (`Added to project tasks` / `Not yet a task`).
+5. **Ending**: an explicit host-end makes a best-effort `endActiveConference` call so the space is closed.
+
+### Why Google Meet opens in a new tab
+
+This is a deliberate constraint from Google, not a shortcut. Both were verified
+against current official documentation before implementation:
+
+1. **The Meet Embed SDK no longer exists.** Google retired the Web embed SDK —
+   the legacy embed URLs and `embed.js` now return 404. There is no supported
+   way to render the Meet interface inside another page.
+2. **Cross-origin embedding is blocked anyway.** `meet.google.com` sends
+   `X-Frame-Options: SAMEORIGIN`, so even a hand-rolled iframe of a Meet URL is
+   rejected by the browser before any of our code runs.
+
+Additionally, the Meet REST API creates and manages **spaces** — it does not
+stream video. It returns a join URI; the conference itself is always rendered
+by Google.
+
+So the honest implementation stores the real link and hands it to the browser.
+Faking an in-page stage, drawing decorative mic/camera controls, or silently
+opening a blank page would misrepresent where the video actually happens — none
+of which is done here.
 
 ---
 
 ## 9. Security & Access Control
 
 - **Row Level Security (RLS)**: Enforced on all Supabase tables. Organization members can only read and write records belonging to workspaces where they hold active memberships.
-- **Server-Side Token Generation**: LiveKit API secrets (`LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`) are never exposed to the frontend. Room tokens are short-lived (2 hours TTL) and scoped strictly to authorized rooms.
+- **Server-Side Only Credentials**: The Google OAuth client id, secret and refresh token live only in server-side environment variables (never prefixed `VITE_`, so Vite cannot inline them into the public bundle). The browser is only ever handed the finished `https://meet.google.com/` link. Access tokens are minted server-side, cached in memory for their lifetime, and never leave the API.
+- **Least-Privilege Scope**: the only Google scope requested is `https://www.googleapis.com/auth/meetings.space.created`, which can create spaces but cannot read a user's Drive, mail or calendar.
 - **Immutable Audit Logging**: Administrative events, role updates, and setup provisioning are logged with timestamps, actor IDs, and IP metadata.
 
 ---
@@ -244,10 +271,15 @@ Set these in the Vercel project under **Settings → Environment Variables**
 | `VITE_SUPABASE_ANON_KEY` | Supabase anon key (baked into the client bundle) |
 | `SUPABASE_SERVICE_ROLE_KEY` | Server-only. Never exposed to the browser |
 | `APP_URL` | Public URL of this deployment. Builds invitation links |
-| `LIVEKIT_URL` | LiveKit Cloud WebSocket URL for Sam_Teck Meet |
-| `LIVEKIT_API_KEY` | LiveKit API key (server-only) |
-| `LIVEKIT_API_SECRET` | LiveKit API secret (server-only) |
+| `GOOGLE_MEET_CLIENT_ID` | Optional. Google OAuth client id (server-only) |
+| `GOOGLE_MEET_CLIENT_SECRET` | Optional. Google OAuth client secret (server-only) |
+| `GOOGLE_MEET_REFRESH_TOKEN` | Optional. Grant used to mint access tokens (server-only) |
 | `SETUP_PROVISIONING_SECRET` | Optional first-run provisioning token |
+
+> The three `GOOGLE_MEET_*` values are optional: leave them unset and the rest
+> of the app works unchanged, with meeting joins reporting that Google Meet is
+> not connected to this deployment. They are deliberately **not** `VITE_*` —
+> such values would be inlined into the public bundle.
 
 > `APP_URL` must be the real public URL (e.g. `https://your-app.vercel.app`),
 > not `localhost`. Invitation links are constructed from it, so a wrong value
