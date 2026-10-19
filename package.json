@@ -13,7 +13,8 @@
     "test": "tsx scripts/check-migrations.ts",
     "test:meet": "tsx --test src/lib/googleMeet.test.ts",
     "test:unit": "tsx --test src/utils/*.test.ts src/lib/*.test.ts",
-    "test:rls": "tsx scripts/verify-meetings-rls.ts"
+    "test:rls": "tsx scripts/verify-meetings-rls.ts",
+    "google-meet:oauth": "tsx scripts/google-meet-oauth.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
