@@ -462,7 +462,11 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
             </div>
           ) : (
             <div className="space-y-3">
-              {upcomingMeetings.map((meeting) => (
+              {upcomingMeetings.map((meeting) => {
+                // Only a meeting with a real LiveKit room can be opened
+                // online; physical sessions have no virtual room to join.
+                const canJoinRoom = Boolean(meeting.livekit_room_name);
+                return (
                 <div
                   key={meeting.id}
                   className="bg-white p-5 rounded-xl border border-[#DCE5F0] shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:border-[#123B73] transition"
@@ -505,13 +509,19 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
                   </div>
 
                   <div className="flex items-center gap-2">
-                    <button
-                      onClick={() => setActiveMeeting(meeting)}
-                      className="px-4 py-2 bg-[#123B73] hover:bg-[#2457A7] text-white text-xs font-bold rounded-lg transition shadow-xs flex items-center gap-1.5"
-                    >
-                      <Video className="w-3.5 h-3.5" />
-                      <span>Join Room</span>
-                    </button>
+                    {canJoinRoom ? (
+                      <button
+                        onClick={() => setActiveMeeting(meeting)}
+                        className="px-4 py-2 bg-[#123B73] hover:bg-[#2457A7] text-white text-xs font-bold rounded-lg transition shadow-xs flex items-center gap-1.5"
+                      >
+                        <Video className="w-3.5 h-3.5" />
+                        <span>Join Room</span>
+                      </button>
+                    ) : (
+                      <span className="px-4 py-2 bg-slate-100 text-[#65758B] text-xs font-semibold rounded-lg border border-[#DCE5F0]">
+                        In-person session
+                      </span>
+                    )}
 
                     {canDeleteMeeting && (
                       <button
@@ -533,7 +543,8 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
                     )}
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>

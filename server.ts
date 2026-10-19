@@ -547,12 +547,9 @@ app.post('/api/setup/initialize-admin', async (req: Request, res: Response) => {
 app.post('/api/meet/token', requireAuth, async (req: AuthedRequest, res: Response) => {
   try {
     const callerId = req.callerId as string;
-    const { roomName, participantName } = req.body as {
-      roomName?: string;
-      participantName?: string;
-    };
+    const { roomName } = req.body as { roomName?: string };
 
-    if (!roomName) {
+    if (!roomName || typeof roomName !== 'string' || roomName.length > 200) {
       return res.status(400).json({ error: 'roomName is required' });
     }
 
@@ -574,12 +571,28 @@ app.post('/api/meet/token', requireAuth, async (req: AuthedRequest, res: Respons
       return res.status(403).json({ error: 'That meeting room does not exist or is no longer available.' });
     }
 
+    // A room that was closed stays closed: no token is issued for a session
+    // that has already been completed or cancelled, so a stale link or a
+    // guessed room name cannot be used to reopen it.
+    if (meeting.status === 'completed' || meeting.status === 'cancelled') {
+      return res.status(410).json({
+        error: 'This meeting has ended and can no longer be joined. Ask the host to schedule a new session.',
+      });
+    }
+
+    if (!meeting.livekit_room_name) {
+      return res.status(400).json({ error: 'This meeting has no virtual room configured.' });
+    }
+
     const membership = await getCallerMembership(callerId, meeting.organization_id);
     if (!membership) {
       return res.status(403).json({ error: 'You are not an active member of the organisation that owns this meeting.' });
     }
 
     const isLead = MEETING_LEAD_ROLES.has(membership.role);
+    // Host identity comes from the meeting record itself (written at creation
+    // time under an RLS policy that pins host_id to auth.uid()), never from
+    // anything the caller sends.
     const isHost = meeting.host_id === callerId;
 
     if (meeting.is_private && !isLead && !isHost) {
@@ -607,30 +620,57 @@ app.post('/api/meet/token', requireAuth, async (req: AuthedRequest, res: Respons
     const apiSecret = process.env.LIVEKIT_API_SECRET;
     const livekitUrl = process.env.LIVEKIT_URL || '';
 
-    if (!apiKey || !apiSecret) {
+    if (!apiKey || !apiSecret || !livekitUrl) {
       // If LiveKit credentials are not configured yet on the backend, inform caller cleanly
       return res.status(503).json({
         error: 'LIVEKIT_NOT_CONFIGURED',
-        message: 'LiveKit credentials (LIVEKIT_API_KEY / LIVEKIT_API_SECRET) must be set in .env to issue production WebRTC tokens.',
+        message:
+          'LiveKit credentials (LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET) must be set on the server to issue production WebRTC tokens.',
       });
     }
+
+    // The display name shown in the roster is read from the caller's own
+    // profile row, not from the request body, so a token can never present
+    // somebody else's name. The client-supplied name is only a fallback for
+    // accounts whose profile row is missing.
+    const { data: callerProfile } = await supabaseAdmin
+      .from('profiles')
+      .select('full_name')
+      .eq('id', callerId)
+      .maybeSingle();
+
+    const requestedName = typeof req.body?.participantName === 'string' ? req.body.participantName.trim() : '';
+    const displayName =
+      (callerProfile?.full_name || '').trim().slice(0, 80) ||
+      requestedName.slice(0, 80) ||
+      'Participant';
 
     const identity = callerId;
 
     // Issue short-lived, securely scoped room token (2 hours)
     const at = new AccessToken(apiKey, apiSecret, {
       identity,
-      name: participantName || identity,
+      name: displayName,
       ttl: '2h',
+      // Metadata travels with the participant into the room, so every client
+      // can badge the host from data the server derived — not from a flag the
+      // browser chose for itself.
+      metadata: JSON.stringify({ userId: callerId, name: displayName, isHost }),
     });
 
     at.addGrant({
       roomJoin: true,
-      room: roomName,
+      room: meeting.livekit_room_name,
+      // Every authorised attendee may speak, show video, share their screen
+      // and use in-meeting chat. LiveKit enforces these grants per
+      // connection, so a modified frontend cannot exceed them.
       canPublish: true,
       canSubscribe: true,
       canPublishData: true,
-      // Room administration follows the meeting record, not a client flag.
+      canUpdateOwnMetadata: true,
+      // Room administration (muting or removing other participants, ending
+      // the room) follows the meeting record and the trusted role model, not
+      // a client flag.
       roomAdmin: Boolean(isHost || isLead),
     });
 
@@ -639,8 +679,11 @@ app.post('/api/meet/token', requireAuth, async (req: AuthedRequest, res: Respons
     return res.json({
       token,
       livekitUrl,
-      roomName,
+      serverUrl: livekitUrl,
+      roomName: meeting.livekit_room_name,
       identity,
+      isHost,
+      displayName,
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Token generation error';
