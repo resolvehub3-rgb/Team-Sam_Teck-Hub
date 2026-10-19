@@ -77,7 +77,7 @@ const meetingPayload = (orgId: string, hostId: string, extra: Record<string, unk
   duration_minutes: 30,
   timezone: 'UTC',
   status: 'scheduled',
-  livekit_room_name: `rls-verify-room-${stamp}-${seq}`,
+  room_name: `rls-verify-room-${stamp}-${seq}`,
   is_private: false,
   ...extra,
 });
@@ -359,7 +359,7 @@ const run = async () => {
       if (u) await admin.auth.admin.deleteUser(u.id);
     }
     // Belt & braces: no RLS Verify meeting may remain, in any org.
-    await admin.from('meetings').delete().like('livekit_room_name', 'rls-verify-room-%');
+    await admin.from('meetings').delete().like('room_name', 'rls-verify-room-%');
     console.log('\nCleanup complete.');
   }
 

@@ -17,7 +17,23 @@ import {
 import { useAuth } from '../context/AuthContext';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { Meeting, Project } from '../types/database';
-import { MeetingRoomView } from './MeetingRoomView';
+import { JoinGoogleMeetButton } from '../components/meeting/JoinGoogleMeetButton';
+import {
+  GoogleMeetApiError,
+  createGoogleMeetSpace,
+  discardTab,
+  openBlankTab,
+  provisionAndOpenGoogleMeet,
+} from '../lib/googleMeet';
+
+/** Roles the server accepts as able to provision a Google Meet space. */
+const MEETING_LEAD_ROLES = new Set([
+  'super_admin',
+  'team_leader',
+  'assistant_leader',
+  'project_manager',
+  'department_lead',
+]);
 
 // Supabase/Postgrest errors are plain objects, not Error instances.
 const getErrorMessage = (err: unknown, fallback: string): string => {
@@ -29,12 +45,6 @@ const getErrorMessage = (err: unknown, fallback: string): string => {
   return fallback;
 };
 
-// Placeholder for a meeting that only exists in memory (never persisted).
-// Any DB write must be gated on a real organization id first: the meetings
-// RLS policy rejects rows whose organization_id the caller is not a member
-// of, and a placeholder UUID matches no organization at all.
-const LOCAL_ONLY_ORG_ID = '00000000-0000-0000-0000-000000000000';
-
 interface SamTeckMeetViewProps {
   initialMeetingSlug?: string;
   onClearMeetingSlug?: () => void;
@@ -44,11 +54,18 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
   initialMeetingSlug,
   onClearMeetingSlug,
 }) => {
-  const { user, organization, hasPermission } = useAuth();
+  const { user, organization, role, hasPermission } = useAuth();
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
-  const [activeMeeting, setActiveMeeting] = useState<Meeting | null>(null);
+  // A `/meet/:slug` link highlights the meeting it names instead of opening a
+  // call: Google Meet runs in its own tab, so there is no in-app room for the
+  // deep link to drop the member into.
+  const [highlightedId, setHighlightedId] = useState<string | null>(null);
+
+  // Mirrors the server's rule for who may create a Google Meet space.
+  const canManageMeeting = (m: Meeting) =>
+    m.host_id === user?.id || (typeof role === 'string' && MEETING_LEAD_ROLES.has(role));
 
   // Delete Meeting
   const canDeleteMeeting = hasPermission('delete_meeting');
@@ -84,12 +101,11 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
       const list = (data as Meeting[]) || [];
       setMeetings(list);
 
-      // If initial slug is specified, auto-join
+      // A `/meet/:slug` link resolves to the meeting it names and highlights
+      // it in the list; joining is an explicit click that opens Google Meet.
       if (initialMeetingSlug) {
         const found = list.find((m) => m.slug === initialMeetingSlug);
-        if (found) {
-          setActiveMeeting(found);
-        }
+        if (found) setHighlightedId(found.id);
       }
 
       // Fetch projects for meeting linking
@@ -134,85 +150,123 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
     };
   }, [organization?.id]);
 
+  // Bring a meeting opened from a `/meet/:slug` link into view once the list
+  // has loaded, so the deep link lands on something the member can act on.
+  useEffect(() => {
+    if (!highlightedId || loading) return;
+    const el = document.getElementById(`meeting-${highlightedId}`);
+    el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [highlightedId, loading]);
+
+  /**
+   * Record the outcome of a provisioning attempt against a meeting already in
+   * the list, so its card immediately shows either the link or the reason it
+   * is missing. Nothing else about the row is changed.
+   */
+  const applyProvisionOutcome = (
+    meetingId: string,
+    outcome: { uri: string } | { error: string }
+  ) => {
+    setMeetings((prev) =>
+      prev.map((m) => {
+        if (m.id !== meetingId) return m;
+        return 'uri' in outcome
+          ? { ...m, google_meeting_uri: outcome.uri, google_sync_status: 'synced', google_last_error: null }
+          : { ...m, google_sync_status: 'failed', google_last_error: outcome.error };
+      })
+    );
+  };
+
+  /**
+   * Create the Google Meet space for a meeting that has just been saved,
+   * without opening a tab — used when scheduling, where popping one would be
+   * wrong. Best effort: the meeting stays saved whether or not Google answers,
+   * and the card keeps a Retry when it does not.
+   */
+  const provisionQuietly = async (meeting: Meeting) => {
+    try {
+      const space = await createGoogleMeetSpace(meeting.id);
+      applyProvisionOutcome(meeting.id, { uri: space.meetingUri });
+    } catch (err) {
+      applyProvisionOutcome(meeting.id, {
+        error: err instanceof GoogleMeetApiError ? err.message : 'Google Meet link creation failed.',
+      });
+    }
+  };
+
   // Handle Instant Meeting Launch
   const handleLaunchInstantMeeting = async () => {
     if (!user) return;
     const randomSlug = 'meet-' + Math.random().toString(36).substring(2, 9);
     const roomName = 'samteck-' + randomSlug;
-    // Without a real organization the insert below is guaranteed to be
-    // rejected by the meetings RLS policy (is_org_member(organization_id)),
-    // so we skip the DB write entirely and run the session in memory. Never
-    // substitute a placeholder UUID here — a nil UUID matches no organization.
     const orgId = organization?.id;
 
-    const instantMeeting: Meeting = {
-      id: 'local-' + Date.now(),
-      // Local-only fallback so the in-memory meeting still satisfies the
-      // required field. This value is never written to the database: the
-      // insert below is gated on a real `orgId`.
-      organization_id: orgId || LOCAL_ONLY_ORG_ID,
-      title: 'Instant Collaboration Session',
-      slug: randomSlug,
-      host_id: user.id,
-      start_time: new Date().toISOString(),
-      duration_minutes: 60,
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      status: 'live',
-      livekit_room_name: roomName,
-      is_private: false,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
+    // Open the tab before anything awaits: a window requested after a network
+    // round-trip is routinely refused as a popup. It is discarded again if we
+    // never get a link to put in it.
+    const popup = openBlankTab();
 
-    if (orgId && isSupabaseConfigured()) {
-      try {
-        // The host id must come from the live Supabase session, not from
-        // form state: the meetings INSERT policy requires
-        // host_id = auth.uid(), so anything else is guaranteed to fail.
-        const { data: sessionData } = await supabase.auth.getSession();
-        const sessionUserId = sessionData.session?.user.id;
-
-        // Split into insert + read-back: `INSERT ... RETURNING` (the combined
-        // `.insert().select()` form) used to be rejected by RLS because the
-        // old SELECT policy re-queried public.meetings from within itself.
-        // Migration 20261018120000 fixes that at the database level; the
-        // split insert stays because it also works against databases where
-        // that migration has not been applied yet.
-        const { error: insertErr } = await supabase.from('meetings').insert({
-          organization_id: orgId,
-          title: instantMeeting.title,
-          slug: instantMeeting.slug,
-          host_id: sessionUserId || user.id,
-          start_time: instantMeeting.start_time,
-          duration_minutes: 60,
-          timezone: instantMeeting.timezone,
-          status: 'live',
-          livekit_room_name: roomName,
-        });
-
-        if (insertErr) {
-          console.warn('Could not persist instant meeting to DB:', insertErr);
-        } else {
-          const { data, error: readErr } = await supabase
-            .from('meetings')
-            .select('*, host:profiles(*)')
-            .eq('slug', instantMeeting.slug)
-            .single();
-
-          if (readErr) {
-            console.warn('Could not read back the instant meeting:', readErr);
-          }
-          if (data) {
-            setActiveMeeting(data as Meeting);
-            return;
-          }
-        }
-      } catch (err) {
-        console.warn('Could not persist instant meeting to DB:', err);
-      }
+    // Without a real organization the insert is guaranteed to be rejected by
+    // the meetings RLS policy, so nothing is written — and a meeting that was
+    // never persisted cannot be given a Google Meet space either. Say so
+    // instead of opening a link that leads nowhere.
+    if (!orgId || !isSupabaseConfigured()) {
+      discardTab(popup);
+      alert('Your account is not linked to an organization yet, so an instant meeting cannot be created.');
+      return;
     }
 
-    setActiveMeeting(instantMeeting);
+    try {
+      // The host id must come from the live Supabase session, not from form
+      // state: the meetings INSERT policy requires host_id = auth.uid().
+      const { data: sessionData } = await supabase.auth.getSession();
+      const sessionUserId = sessionData.session?.user.id;
+
+      // Split into insert + read-back: `INSERT ... RETURNING` (the combined
+      // `.insert().select()` form) used to be rejected by RLS because the old
+      // SELECT policy re-queried public.meetings from within itself.
+      // Migration 20261018120000 fixes that at the database level; the split
+      // insert stays because it also works where that migration is not applied.
+      const { error: insertErr } = await supabase.from('meetings').insert({
+        organization_id: orgId,
+        title: 'Instant Collaboration Session',
+        slug: randomSlug,
+        host_id: sessionUserId || user.id,
+        start_time: new Date().toISOString(),
+        duration_minutes: 60,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        status: 'live',
+        room_name: roomName,
+      });
+      if (insertErr) throw insertErr;
+
+      const { data, error: readErr } = await supabase
+        .from('meetings')
+        .select('*, host:profiles(*)')
+        .eq('slug', randomSlug)
+        .single();
+      if (readErr) throw readErr;
+      if (!data) {
+        discardTab(popup);
+        return;
+      }
+
+      const created = data as Meeting;
+      setMeetings((prev) => [created, ...prev]);
+
+      const outcome = await provisionAndOpenGoogleMeet(created.id, popup);
+      if (outcome.uri) {
+        applyProvisionOutcome(created.id, { uri: outcome.uri });
+      } else {
+        const message = outcome.error?.message || 'Google Meet link creation failed.';
+        applyProvisionOutcome(created.id, { error: message });
+        alert(`The meeting was created, but its Google Meet link could not be created: ${message}`);
+      }
+    } catch (err) {
+      discardTab(popup);
+      console.error('Could not create the instant meeting:', err);
+      alert('The instant meeting could not be created. Check your permissions and try again.');
+    }
   };
 
   // Schedule Meeting in Supabase
@@ -292,7 +346,7 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
         duration_minutes: parseInt(newDuration, 10) || 45,
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         status: 'scheduled',
-        livekit_room_name: roomName,
+        room_name: roomName,
       });
 
       if (insertErr) throw insertErr;
@@ -311,7 +365,11 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
       setNewDesc('');
       fetchMeetings();
       if (data) {
-        setMeetings((prev) => [data as Meeting, ...prev]);
+        const created = data as Meeting;
+        setMeetings((prev) => [created, ...prev]);
+        // Ask Google for the space now, so invitees have a real link before
+        // the start time. Non-blocking: the meeting is already saved.
+        void provisionQuietly(created);
       }
     } catch (err) {
       // Full diagnostics stay in the browser console; the user gets an
@@ -371,20 +429,6 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
     }
   };
 
-  // If in an active meeting, render MeetingRoomView
-  if (activeMeeting) {
-    return (
-      <MeetingRoomView
-        meeting={activeMeeting}
-        onLeaveMeeting={() => {
-          setActiveMeeting(null);
-          if (onClearMeetingSlug) onClearMeetingSlug();
-          fetchMeetings();
-        }}
-      />
-    );
-  }
-
   const upcomingMeetings = meetings.filter((m) => m.status === 'scheduled' || m.status === 'live');
   const pastMeetings = meetings.filter((m) => m.status === 'completed' || m.status === 'cancelled');
 
@@ -399,10 +443,10 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
             </div>
             <div>
               <h1 className="text-xl font-bold text-[#172B4D]">
-                Sam_Teck Meet: Native Virtual Meetings
+                Sam_Teck Meet — powered by Google Meet
               </h1>
               <p className="text-xs text-[#65758B]">
-                Branded real-time audio, video, screen share, and meeting minutes with task integration.
+                Schedule, invite and launch Google Meet sessions, with minutes and action items that convert into project tasks.
               </p>
             </div>
           </div>
@@ -463,13 +507,17 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
           ) : (
             <div className="space-y-3">
               {upcomingMeetings.map((meeting) => {
-                // Only a meeting with a real LiveKit room can be opened
-                // online; physical sessions have no virtual room to join.
-                const canJoinRoom = Boolean(meeting.livekit_room_name);
+                const manage = canManageMeeting(meeting);
+                const highlighted = highlightedId === meeting.id;
                 return (
                 <div
                   key={meeting.id}
-                  className="bg-white p-5 rounded-xl border border-[#DCE5F0] shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:border-[#123B73] transition"
+                  id={`meeting-${meeting.id}`}
+                  className={`bg-white p-5 rounded-xl shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4 transition ${
+                    highlighted
+                      ? 'border-2 border-[#2457A7] ring-2 ring-[#2457A7]/20'
+                      : 'border border-[#DCE5F0] hover:border-[#123B73]'
+                  }`}
                 >
                   <div className="space-y-1">
                     <div className="flex items-center gap-2">
@@ -509,19 +557,14 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
                   </div>
 
                   <div className="flex items-center gap-2">
-                    {canJoinRoom ? (
-                      <button
-                        onClick={() => setActiveMeeting(meeting)}
-                        className="px-4 py-2 bg-[#123B73] hover:bg-[#2457A7] text-white text-xs font-bold rounded-lg transition shadow-xs flex items-center gap-1.5"
-                      >
-                        <Video className="w-3.5 h-3.5" />
-                        <span>Join Room</span>
-                      </button>
-                    ) : (
-                      <span className="px-4 py-2 bg-slate-100 text-[#65758B] text-xs font-semibold rounded-lg border border-[#DCE5F0]">
-                        In-person session
-                      </span>
-                    )}
+                    <JoinGoogleMeetButton
+                      meeting={meeting}
+                      canManage={manage}
+                      compact
+                      onSpaceCreated={(space) =>
+                        applyProvisionOutcome(meeting.id, { uri: space.meetingUri })
+                      }
+                    />
 
                     {canDeleteMeeting && (
                       <button
@@ -560,15 +603,15 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
             <ul className="text-xs text-[#65758B] space-y-2">
               <li className="flex items-start gap-1.5">
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0 mt-0.5" />
-                <span>WebRTC encrypted real-time audio and video.</span>
+                <span>Google Meet runs the call: video, audio, chat and screen sharing.</span>
               </li>
               <li className="flex items-start gap-1.5">
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0 mt-0.5" />
-                <span>Non-guessable room tokens with strict TTL.</span>
+                <span>Google OAuth credentials stay on the server — the browser only ever receives the join link.</span>
               </li>
               <li className="flex items-start gap-1.5">
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0 mt-0.5" />
-                <span>Minutes & Action items convert directly into project tasks.</span>
+                <span>Minutes &amp; Action items convert directly into project tasks.</span>
               </li>
             </ul>
           </div>

@@ -1,6 +1,6 @@
 # Sam_Teck Hub
 
-A production-grade, unified SaaS platform for project and task management, team collaboration, native branded virtual meetings (**Sam_Teck Meet**), technology innovation, professional development, and operational reporting.
+A production-grade, unified SaaS platform for project and task management, team collaboration, virtual meetings on Google Meet (**Sam_Teck Meet**), technology innovation, professional development, and operational reporting.
 
 ---
 
@@ -76,11 +76,19 @@ VITE_SUPABASE_ANON_KEY="your-anon-public-key"
 SUPABASE_SERVICE_ROLE_KEY="your-service-role-key"
 
 # ====================================================================
-# LIVEKIT CLOUD CONFIGURATION (FOR SAM_TECK MEET)
+# GOOGLE MEET CONFIGURATION (FOR SAM_TECK MEET) - SERVER-SIDE ONLY
 # ====================================================================
-LIVEKIT_URL="wss://your-project.livekit.cloud"
-LIVEKIT_API_KEY="your-livekit-api-key"
-LIVEKIT_API_SECRET="your-livekit-api-secret"
+# An API key does NOT work here. The Meet REST API replies to every API-key
+# request with 401 "API keys are not supported by this API. Expected OAuth2
+# access token..." You need OAuth 2.0 user credentials from a Google Cloud
+# project with the Google Meet API enabled and the `meetings.space.created`
+# scope. Full setup steps are in .env.example.
+#
+# Never prefix these with VITE_ / NEXT_PUBLIC_: Vite inlines such values into
+# the public browser bundle, publishing your credentials to every visitor.
+GOOGLE_MEET_CLIENT_ID=""
+GOOGLE_MEET_CLIENT_SECRET=""
+GOOGLE_MEET_REFRESH_TOKEN=""
 
 # ====================================================================
 # FIRST-TIME SETUP PROVISIONING SECRET (OPTIONAL)

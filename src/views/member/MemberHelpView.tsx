@@ -61,7 +61,7 @@ export const MemberHelpView: React.FC<{ onNavigate: (tab: NavigationTab) => void
     {
       question: 'Where do meeting tokens come from?',
       answer:
-        'Sam_Teck Meet tokens are minted by the server after it verifies your session and checks that you are entitled to the room. LiveKit credentials never reach the browser, and you cannot join a room you were not invited to.',
+        'Google Meet links are created by the server after it verifies your session and checks that you are entitled to the meeting. Google OAuth credentials never reach the browser, and you cannot open a private meeting you were not invited to.',
     },
     {
       question: 'I was not notified about anything.',

@@ -29,7 +29,8 @@ export default function handler(_req: unknown, res: { status: (n: number) => { j
       envVarCount: envKeys.length,
       hasSupabaseUrl: Boolean(process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL),
       hasServiceRoleKey: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
-      hasLiveKitKey: Boolean(process.env.LIVEKIT_API_KEY),
+      hasGoogleMeetClientId: Boolean(process.env.GOOGLE_MEET_CLIENT_ID),
+      hasGoogleMeetRefreshToken: Boolean(process.env.GOOGLE_MEET_REFRESH_TOKEN),
       hasSetupSecret: Boolean(process.env.SETUP_PROVISIONING_SECRET),
     },
   });

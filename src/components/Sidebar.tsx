@@ -135,7 +135,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <span className="text-blue-300 font-mono">v1.0.0</span>
         </div>
         <div className="text-[10px] text-slate-500">
-          Connected to Supabase & LiveKit Cloud
+          Connected to Supabase &amp; Google Meet
         </div>
       </div>
     </div>

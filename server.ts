@@ -3,7 +3,6 @@ import dotenv from 'dotenv';
 import path from 'path';
 import crypto from 'crypto';
 import { createClient } from '@supabase/supabase-js';
-import { AccessToken } from 'livekit-server-sdk';
 
 dotenv.config();
 
@@ -165,6 +164,245 @@ const MEETING_LEAD_ROLES = new Set([
   'department_lead',
 ]);
 
+// ---------------------------------------------------------------------------
+// GOOGLE MEET REST API CLIENT (server-only credentials)
+// ---------------------------------------------------------------------------
+//
+// Why an OAuth refresh token and not an API key: the Meet REST API answers
+// every API-key request with
+//
+//   401 UNAUTHENTICATED "API keys are not supported by this API.
+//      Expected OAuth2 access token or other authentication credentials
+//      that assert a principal."
+//
+// and Google's own guide states "For Meet REST API, you can only authenticate
+// using user authentication." So the app exchanges a refresh token minted by
+// an authorised Google Workspace account for a short-lived access token here,
+// on the server, and never forwards that token to the browser.
+//
+// All three values live in server-side environment variables only. They are
+// never read by Vite (no VITE_ prefix), never logged, never placed in a URL,
+// and never returned in a response body.
+
+const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
+const GOOGLE_MEET_API_BASE = 'https://meet.googleapis.com/v2';
+
+interface GoogleMeetConfig {
+  clientId: string;
+  clientSecret: string;
+  refreshToken: string;
+}
+
+/**
+ * Read the Google OAuth configuration, or null when it is not supplied yet.
+ * The integration degrades to an explicit "not configured" error instead of
+ * throwing, so the rest of the application keeps working untouched.
+ */
+function readGoogleMeetConfig(): GoogleMeetConfig | null {
+  const clientId = readEnv('GOOGLE_MEET_CLIENT_ID');
+  const clientSecret = readEnv('GOOGLE_MEET_CLIENT_SECRET');
+  const refreshToken = readEnv('GOOGLE_MEET_REFRESH_TOKEN');
+  if (!clientId || !clientSecret || !refreshToken) return null;
+  return { clientId, clientSecret, refreshToken };
+}
+
+/** In-memory access-token cache. Never persisted, never serialised. */
+let googleAccessToken: { value: string; expiresAt: number } | null = null;
+
+/**
+ * Exchange the refresh token for an access token, reusing the cached one
+ * until shortly before it expires.
+ *
+ * The response is treated as opaque: only `access_token` and `expires_in`
+ * are read, and the token is held in module scope so it cannot leak through
+ * a response, a log line or an error message.
+ */
+async function getGoogleAccessToken(cfg: GoogleMeetConfig): Promise<string> {
+  const now = Date.now();
+  if (googleAccessToken && googleAccessToken.expiresAt - now > 60_000) {
+    return googleAccessToken.value;
+  }
+
+  const res = await fetch(GOOGLE_TOKEN_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: cfg.clientId,
+      client_secret: cfg.clientSecret,
+      refresh_token: cfg.refreshToken,
+      grant_type: 'refresh_token',
+    }),
+  });
+
+  const payload = (await res.json().catch(() => ({}))) as {
+    access_token?: string;
+    expires_in?: number;
+    error?: string;
+    error_description?: string;
+  };
+
+  if (!res.ok || !payload.access_token) {
+    // `error_description` from Google's token endpoint is safe to surface
+    // (it names the grant problem, never the secret). The token itself is
+    // not part of this object, so it cannot be echoed by accident.
+    const reason =
+      payload.error_description || payload.error || `token exchange failed with HTTP ${res.status}`;
+    throw new GoogleMeetError('auth', reason, res.status);
+  }
+
+  googleAccessToken = {
+    value: payload.access_token,
+    expiresAt: now + (payload.expires_in ?? 3500) * 1000,
+  };
+  return googleAccessToken.value;
+}
+
+/** Drop the cached token, e.g. after Google reports the grant is gone. */
+function invalidateGoogleAccessToken(): void {
+  googleAccessToken = null;
+}
+
+/**
+ * A failure raised while calling Google, carrying a category the endpoint can
+ * turn into an honest HTTP status. The message is always safe to show a user.
+ */
+class GoogleMeetError extends Error {
+  constructor(
+    readonly kind: 'config' | 'auth' | 'not_found' | 'rate_limit' | 'upstream' | 'bad_response',
+    message: string,
+    readonly status?: number
+  ) {
+    super(message);
+    this.name = 'GoogleMeetError';
+  }
+}
+
+/**
+ * Turn a non-2xx Google response into a message that is safe to show and to
+ * store in `meetings.google_last_error`.
+ *
+ * Google echoes request details in `error.message`; those strings can include
+ * the caller's email or project number but never a token, because we never
+ * send one in a URL. Everything is truncated and stripped of any accidental
+ * bearer credential before it is returned.
+ */
+function describeGoogleFailure(status: number, payload: unknown): string {
+  const body = payload as { error?: { message?: string; status?: string } };
+  const raw = body?.error?.message || '';
+  const cleaned = raw
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [redacted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 300);
+
+  if (status === 401 || status === 403) {
+    return (
+      cleaned ||
+      'Google rejected the authorisation. Re-approve the app on the Google Cloud consent screen and issue a fresh refresh token.'
+    );
+  }
+  if (status === 429) {
+    return cleaned || 'Google is rate-limiting meeting-space creation right now. Try again in a moment.';
+  }
+  if (status >= 500) {
+    return 'Google Meet is temporarily unavailable. The meeting was saved; retry link creation shortly.';
+  }
+  return cleaned || `Google Meet returned an unexpected response (HTTP ${status}).`;
+}
+
+/** True when the string is a joinable Google Meet link. */
+function isGoogleMeetUri(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.hostname === 'meet.google.com';
+  } catch {
+    return false;
+  }
+}
+
+/** Call a Meet REST API method with a freshly minted access token. */
+async function callMeetApi(
+  cfg: GoogleMeetConfig,
+  path: string,
+  init: RequestInit = {}
+): Promise<unknown> {
+  const token = await getGoogleAccessToken(cfg);
+
+  let res: Awaited<ReturnType<typeof fetch>>;
+  try {
+    res = await fetch(`${GOOGLE_MEET_API_BASE}${path}`, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        ...(init.headers || {}),
+      },
+    });
+  } catch {
+    // Network-level failure: report availability, not internals.
+    throw new GoogleMeetError(
+      'upstream',
+      'Could not reach the Google Meet API. Check the server outbound network and retry.'
+    );
+  }
+
+  const payload = await res.json().catch(() => ({}));
+
+  if (res.ok) return payload;
+
+  if (res.status === 401) {
+    // The cached access token was rejected: clear it so the retry renews it.
+    invalidateGoogleAccessToken();
+    throw new GoogleMeetError('auth', describeGoogleFailure(res.status, payload), res.status);
+  }
+  if (res.status === 404) {
+    throw new GoogleMeetError('not_found', describeGoogleFailure(res.status, payload), res.status);
+  }
+  if (res.status === 429) {
+    throw new GoogleMeetError('rate_limit', describeGoogleFailure(res.status, payload), res.status);
+  }
+  throw new GoogleMeetError('upstream', describeGoogleFailure(res.status, payload), res.status);
+}
+
+/**
+ * Create a new meeting space.
+ *
+ * `spaceConfig.entryPointAccess` is deliberately left unset (Google default
+ * `ALL`): `CREATOR_APP_ONLY` would restrict joining to entry points owned by
+ * this Cloud project, which is not what a Sam_Teck Hub member opening
+ * meet.google.com needs.
+ */
+async function createGoogleMeetSpace(cfg: GoogleMeetConfig): Promise<{
+  name: string;
+  meetingUri: string;
+}> {
+  const payload = (await callMeetApi(cfg, '/spaces', { method: 'POST', body: '{}' })) as {
+    name?: string;
+    meetingUri?: string;
+  };
+
+  if (!payload.name || !isGoogleMeetUri(payload.meetingUri)) {
+    // A 200 without a usable join link is a protocol violation: never let it
+    // be stored, because the member would click a broken button later.
+    throw new GoogleMeetError(
+      'bad_response',
+      'Google accepted the request but returned no usable meeting link. Nothing was saved.'
+    );
+  }
+  return { name: payload.name, meetingUri: payload.meetingUri };
+}
+
+/** Read a space back, used to re-validate a link already stored on a meeting. */
+async function getGoogleMeetSpace(
+  cfg: GoogleMeetConfig,
+  name: string
+): Promise<{ name: string; meetingUri?: string }> {
+  return (await callMeetApi(cfg, `/spaces/${encodeURIComponent(name.replace(/^spaces\//, ''))}`, {
+    method: 'GET',
+  })) as { name: string; meetingUri?: string };
+}
+
 // 1. HEALTH & SERVICE INTEGRATION CHECK
 app.get('/api/health', async (_req: Request, res: Response) => {
   const isSupabaseConfigured = Boolean(supabaseUrl && (supabaseAnonKey || supabaseServiceKey));
@@ -208,11 +446,8 @@ app.get('/api/health', async (_req: Request, res: Response) => {
     );
   }
 
-  const isLivekitConfigured = Boolean(
-    process.env.LIVEKIT_URL &&
-    process.env.LIVEKIT_API_KEY &&
-    process.env.LIVEKIT_API_SECRET
-  );
+  const googleMeetConfig = readGoogleMeetConfig();
+  const isGoogleMeetConfigured = Boolean(googleMeetConfig);
 
   let dbReachable = false;
   if (supabaseAdmin) {
@@ -235,9 +470,17 @@ app.get('/api/health', async (_req: Request, res: Response) => {
       reachable: dbReachable,
       url: supabaseUrl ? supabaseUrl.replace(/^(https?:\/\/[^/]+).*/, '$1') : null,
     },
-    livekit: {
-      configured: isLivekitConfigured,
-      serverUrl: process.env.LIVEKIT_URL || null,
+    googleMeet: {
+      configured: isGoogleMeetConfigured,
+      // Presence only. Credentials are never echoed back — /api/health is
+      // reachable without a session.
+      missing: isGoogleMeetConfigured
+        ? []
+        : (
+            (['GOOGLE_MEET_CLIENT_ID', 'GOOGLE_MEET_CLIENT_SECRET', 'GOOGLE_MEET_REFRESH_TOKEN'] as const).filter(
+              (name) => !readEnv(name)
+            )
+          ),
     },
     setup: {
       initialAdminProvisioned: hasProvisionedInitialAdmin,
@@ -534,54 +777,55 @@ app.post('/api/setup/initialize-admin', async (req: Request, res: Response) => {
   }
 });
 
-// 4. LIVEKIT TOKEN GENERATION FOR SAM_TECK MEET
+// 4. GOOGLE MEET: PROVISION A MEETING SPACE (ORGANISER / LEADERSHIP ACTION)
 //
-// Secure meeting access is enforced *here*, not in the UI:
-//   1. the caller must present a valid Supabase session JWT,
-//   2. the room must belong to a real Sam_Teck meeting record,
-//   3. the caller must be an active member of that meeting's organisation,
-//   4. for private sessions, the caller must also be the host, an invitee,
-//      an attendee, or a leadership member.
-// The participant identity is taken from the verified session — never from
-// the request body — so nobody can join as somebody else.
-app.post('/api/meet/token', requireAuth, async (req: AuthedRequest, res: Response) => {
+//     Google Meet cannot be rendered inside this page — meet.google.com
+//     answers every cross-origin frame with `X-Frame-Options: SAMEORIGIN` and
+//     Google has withdrawn the Embed SDK — so the conference UI itself is not
+//     embeddable. What the Meet REST API genuinely supports is creating a
+//     meeting space and returning the real join link, which is what this
+//     route does. The link is then opened in a new tab.
+//
+//     Authorisation is enforced HERE, not in the UI:
+//       1. the caller must present a valid Supabase session JWT,
+//       2. the meeting must be a real Sam_Teck record,
+//       3. the caller must be an active member of its organisation,
+//       4. the caller must be that meeting's host or hold a leadership role,
+//       5. the meeting must still be joinable.
+//     The space is created at most once per meeting, so a retried request
+//     can never mint a second link and orphan the first.
+app.post('/api/meet/google/space', requireAuth, async (req: AuthedRequest, res: Response) => {
   try {
     const callerId = req.callerId as string;
-    const { roomName } = req.body as { roomName?: string };
+    const { meetingId } = req.body as { meetingId?: string };
 
-    if (!roomName || typeof roomName !== 'string' || roomName.length > 200) {
-      return res.status(400).json({ error: 'roomName is required' });
+    if (!meetingId || typeof meetingId !== 'string') {
+      return res.status(400).json({ error: 'meetingId is required' });
     }
-
     if (!supabaseAdmin) {
       return res.status(503).json({ error: 'Database service is not configured' });
     }
 
-    // Resolve the room to a real meeting we can authorise against.
+    const cfg = readGoogleMeetConfig();
+    if (!cfg) {
+      return res.status(503).json({
+        error: 'GOOGLE_MEET_NOT_CONFIGURED',
+        message:
+          'Google Meet is not configured on this deployment yet. Set GOOGLE_MEET_CLIENT_ID, GOOGLE_MEET_CLIENT_SECRET and GOOGLE_MEET_REFRESH_TOKEN on the server.',
+      });
+    }
+
     const { data: meeting, error: meetingErr } = await supabaseAdmin
       .from('meetings')
-      .select('id, title, organization_id, host_id, is_private, status, livekit_room_name')
-      .eq('livekit_room_name', roomName)
+      .select('id, title, organization_id, host_id, status, google_space_name, google_meeting_uri')
+      .eq('id', meetingId)
       .maybeSingle();
 
     if (meetingErr) {
       return res.status(500).json({ error: meetingErr.message });
     }
     if (!meeting) {
-      return res.status(403).json({ error: 'That meeting room does not exist or is no longer available.' });
-    }
-
-    // A room that was closed stays closed: no token is issued for a session
-    // that has already been completed or cancelled, so a stale link or a
-    // guessed room name cannot be used to reopen it.
-    if (meeting.status === 'completed' || meeting.status === 'cancelled') {
-      return res.status(410).json({
-        error: 'This meeting has ended and can no longer be joined. Ask the host to schedule a new session.',
-      });
-    }
-
-    if (!meeting.livekit_room_name) {
-      return res.status(400).json({ error: 'This meeting has no virtual room configured.' });
+      return res.status(404).json({ error: 'That meeting does not exist.' });
     }
 
     const membership = await getCallerMembership(callerId, meeting.organization_id);
@@ -589,11 +833,182 @@ app.post('/api/meet/token', requireAuth, async (req: AuthedRequest, res: Respons
       return res.status(403).json({ error: 'You are not an active member of the organisation that owns this meeting.' });
     }
 
-    const isLead = MEETING_LEAD_ROLES.has(membership.role);
-    // Host identity comes from the meeting record itself (written at creation
-    // time under an RLS policy that pins host_id to auth.uid()), never from
-    // anything the caller sends.
     const isHost = meeting.host_id === callerId;
+    const isLead = MEETING_LEAD_ROLES.has(membership.role);
+    if (!isHost && !isLead) {
+      return res.status(403).json({
+        error: 'Only the meeting host or a team leader can create the Google Meet link for this meeting.',
+      });
+    }
+
+    if (meeting.status === 'completed' || meeting.status === 'cancelled') {
+      return res.status(410).json({ error: 'This meeting has ended, so a new link cannot be created.' });
+    }
+
+    // Already provisioned: hand back the stored link. This is what makes a
+    // double-click or a network retry idempotent.
+    if (meeting.google_space_name && isGoogleMeetUri(meeting.google_meeting_uri)) {
+      return res.json({
+        name: meeting.google_space_name,
+        meetingUri: meeting.google_meeting_uri,
+        cached: true,
+      });
+    }
+
+    let spaceName = meeting.google_space_name || '';
+    let meetingUri = '';
+
+    if (spaceName) {
+      // A space exists but its join link is missing or unusable: repair it
+      // from Google rather than creating a duplicate space.
+      try {
+        const existing = await getGoogleMeetSpace(cfg, spaceName);
+        if (!isGoogleMeetUri(existing.meetingUri)) {
+          throw new GoogleMeetError('bad_response', 'Google returned no usable meeting link for this space.');
+        }
+        meetingUri = existing.meetingUri;
+      } catch (err) {
+        const gerr = err instanceof GoogleMeetError ? err : null;
+        return res.status(gerr?.kind === 'auth' ? 503 : 502).json({
+          error: 'GOOGLE_MEET_LINK_FAILED',
+          message: gerr?.message || 'The stored Google Meet space could not be read.',
+        });
+      }
+    } else {
+      try {
+        const created = await createGoogleMeetSpace(cfg);
+        spaceName = created.name;
+        meetingUri = created.meetingUri;
+      } catch (err) {
+        const gerr = err instanceof GoogleMeetError ? err : null;
+        const status =
+          gerr?.kind === 'auth' ? 503 : gerr?.kind === 'rate_limit' ? 429 : 502;
+
+        // Record WHY it failed so the interface can explain it, but leave the
+        // meeting otherwise untouched — no half-written link is ever stored.
+        await supabaseAdmin
+          .from('meetings')
+          .update({
+            google_sync_status: 'failed',
+            google_last_error: (gerr?.message || 'Google Meet link creation failed.').slice(0, 500),
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', meetingId)
+          .is('google_space_name', null);
+
+        return res.status(status).json({
+          error: gerr?.kind === 'auth' ? 'GOOGLE_MEET_AUTH_FAILED' : 'GOOGLE_MEET_LINK_FAILED',
+          message: gerr?.message || 'Google Meet link creation failed.',
+        });
+      }
+    }
+
+    // Compare-and-set on `google_space_name IS NULL`: if two requests race,
+    // exactly one writes and the loser discards its space instead of leaving
+    // the meeting pointing at a link nobody else knows about.
+    const { data: written, error: writeErr } = await supabaseAdmin
+      .from('meetings')
+      .update({
+        google_space_name: spaceName,
+        google_meeting_uri: meetingUri,
+        google_sync_status: 'synced',
+        google_last_error: null,
+        google_synced_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', meetingId)
+      .is('google_space_name', null)
+      .select('google_space_name, google_meeting_uri');
+
+    if (writeErr) {
+      return res.status(500).json({ error: `The Google Meet link could not be saved: ${writeErr.message}` });
+    }
+
+    const stored = Array.isArray(written) && written.length ? written[0] : null;
+    if (!stored) {
+      // Lost the race (or the link was being repaired): read the winner back.
+      const { data: winner } = await supabaseAdmin
+        .from('meetings')
+        .select('google_space_name, google_meeting_uri')
+        .eq('id', meetingId)
+        .maybeSingle();
+      if (winner?.google_space_name && isGoogleMeetUri(winner.google_meeting_uri)) {
+        return res.json({
+          name: winner.google_space_name,
+          meetingUri: winner.google_meeting_uri,
+          cached: true,
+        });
+      }
+      return res.status(500).json({ error: 'The Google Meet link could not be saved to this meeting.' });
+    }
+
+    // Audit trail, best effort. Only the resource name is recorded — never a
+    // token, a refresh token or a client secret.
+    try {
+      await supabaseAdmin.from('audit_logs').insert({
+        user_id: callerId,
+        action: 'GOOGLE_MEET_SPACE_CREATED',
+        target_entity: 'meetings',
+        target_id: meeting.id,
+        details: { title: meeting.title, space_name: stored.google_space_name },
+        ip_address: req.ip || null,
+      });
+    } catch (auditErr) {
+      console.warn('Google Meet space audit entry failed:', auditErr);
+    }
+
+    return res.json({
+      name: stored.google_space_name,
+      meetingUri: stored.google_meeting_uri,
+      cached: false,
+    });
+  } catch (err: unknown) {
+    console.error('Error creating Google Meet space:', err);
+    return res
+      .status(500)
+      .json({ error: err instanceof Error ? err.message : 'Creating the meeting link failed' });
+  }
+});
+
+// 4a. GOOGLE MEET: READ THE JOIN LINK FOR A MEETING
+//
+//     Knowing (or editing) a URL must never grant access. This route
+//     re-applies the meetings SELECT policy on the server: the caller has to
+//     be an active member of the owning organisation AND satisfy one of
+//     public / host / leadership / invited / previously present — checked
+//     against real rows, never against anything in the request.
+app.get('/api/meet/google/space/:meetingId', requireAuth, async (req: AuthedRequest, res: Response) => {
+  try {
+    const callerId = req.callerId as string;
+    const meetingId = req.params.meetingId;
+
+    if (!meetingId || typeof meetingId !== 'string') {
+      return res.status(400).json({ error: 'meetingId is required' });
+    }
+    if (!supabaseAdmin) {
+      return res.status(503).json({ error: 'Database service is not configured' });
+    }
+
+    const { data: meeting, error: meetingErr } = await supabaseAdmin
+      .from('meetings')
+      .select('id, title, organization_id, host_id, is_private, status, start_time, google_space_name, google_meeting_uri')
+      .eq('id', meetingId)
+      .maybeSingle();
+
+    if (meetingErr) {
+      return res.status(500).json({ error: meetingErr.message });
+    }
+    if (!meeting) {
+      return res.status(404).json({ error: 'That meeting does not exist.' });
+    }
+
+    const membership = await getCallerMembership(callerId, meeting.organization_id);
+    if (!membership) {
+      return res.status(403).json({ error: 'You are not an active member of the organisation that owns this meeting.' });
+    }
+
+    const isHost = meeting.host_id === callerId;
+    const isLead = MEETING_LEAD_ROLES.has(membership.role);
 
     if (meeting.is_private && !isLead && !isHost) {
       const [{ data: invited }, { data: attended }] = await Promise.all([
@@ -610,84 +1025,154 @@ app.post('/api/meet/token', requireAuth, async (req: AuthedRequest, res: Respons
           .eq('user_id', callerId)
           .maybeSingle(),
       ]);
-
       if (!invited && !attended) {
         return res.status(403).json({ error: 'You have not been invited to this private meeting.' });
       }
     }
 
-    const apiKey = process.env.LIVEKIT_API_KEY;
-    const apiSecret = process.env.LIVEKIT_API_SECRET;
-    const livekitUrl = process.env.LIVEKIT_URL || '';
-
-    if (!apiKey || !apiSecret || !livekitUrl) {
-      // If LiveKit credentials are not configured yet on the backend, inform caller cleanly
-      return res.status(503).json({
-        error: 'LIVEKIT_NOT_CONFIGURED',
-        message:
-          'LiveKit credentials (LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET) must be set on the server to issue production WebRTC tokens.',
+    if (meeting.status === 'completed' || meeting.status === 'cancelled') {
+      return res.status(410).json({
+        error: 'This meeting has ended and can no longer be joined. Ask the host to schedule a new session.',
       });
     }
 
-    // The display name shown in the roster is read from the caller's own
-    // profile row, not from the request body, so a token can never present
-    // somebody else's name. The client-supplied name is only a fallback for
-    // accounts whose profile row is missing.
-    const { data: callerProfile } = await supabaseAdmin
-      .from('profiles')
-      .select('full_name')
-      .eq('id', callerId)
-      .maybeSingle();
-
-    const requestedName = typeof req.body?.participantName === 'string' ? req.body.participantName.trim() : '';
-    const displayName =
-      (callerProfile?.full_name || '').trim().slice(0, 80) ||
-      requestedName.slice(0, 80) ||
-      'Participant';
-
-    const identity = callerId;
-
-    // Issue short-lived, securely scoped room token (2 hours)
-    const at = new AccessToken(apiKey, apiSecret, {
-      identity,
-      name: displayName,
-      ttl: '2h',
-      // Metadata travels with the participant into the room, so every client
-      // can badge the host from data the server derived — not from a flag the
-      // browser chose for itself.
-      metadata: JSON.stringify({ userId: callerId, name: displayName, isHost }),
-    });
-
-    at.addGrant({
-      roomJoin: true,
-      room: meeting.livekit_room_name,
-      // Every authorised attendee may speak, show video, share their screen
-      // and use in-meeting chat. LiveKit enforces these grants per
-      // connection, so a modified frontend cannot exceed them.
-      canPublish: true,
-      canSubscribe: true,
-      canPublishData: true,
-      canUpdateOwnMetadata: true,
-      // Room administration (muting or removing other participants, ending
-      // the room) follows the meeting record and the trusted role model, not
-      // a client flag.
-      roomAdmin: Boolean(isHost || isLead),
-    });
-
-    const token = await at.toJwt();
+    if (!meeting.google_space_name || !isGoogleMeetUri(meeting.google_meeting_uri)) {
+      return res.status(404).json({
+        error: 'NO_GOOGLE_MEET_SPACE',
+        message: 'No Google Meet link has been created for this meeting yet.',
+        canManage: isHost || isLead,
+      });
+    }
 
     return res.json({
-      token,
-      livekitUrl,
-      serverUrl: livekitUrl,
-      roomName: meeting.livekit_room_name,
-      identity,
-      isHost,
-      displayName,
+      name: meeting.google_space_name,
+      meetingUri: meeting.google_meeting_uri,
+      title: meeting.title,
+      start_time: meeting.start_time,
+      status: meeting.status,
+      canManage: isHost || isLead,
     });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Token generation error';
-    console.error('Error generating LiveKit token:', err);
+    console.error('Error reading Google Meet space:', err);
+    return res
+      .status(500)
+      .json({ error: err instanceof Error ? err.message : 'Reading the meeting link failed' });
+  }
+});
+
+
+// 4a. END A MEETING FOR EVERYONE (HOST / LEADERSHIP ACTION)
+//
+//     Leaving and ending are different things: an ordinary participant
+//     leaving only disconnects themselves, while an authorised end closes the
+//     session for everybody. Authorisation is decided HERE — the caller must
+//     be the meeting's host or hold a leadership role in its organisation,
+//     both checked against database records, never against a client flag.
+//
+//     The sequence matters: the meetings row is marked completed FIRST, so
+//     the authoritative state is durable and every client's realtime
+//     subscription learns the truth even if the Google call below fails.
+//     Ending the active conference then closes it for everyone still in it.
+//
+//     Deliberately NOT called by ordinary participants leaving: a member who
+//     simply drops off must not end the call for the room. Only this
+//     authorised route ever asks Google to end the conference.
+app.post('/api/meet/end', requireAuth, async (req: AuthedRequest, res: Response) => {
+  try {
+    const callerId = req.callerId as string;
+    const { meetingId } = req.body as { meetingId?: string };
+
+    if (!meetingId || typeof meetingId !== 'string') {
+      return res.status(400).json({ error: 'meetingId is required' });
+    }
+    if (!supabaseAdmin) {
+      return res.status(503).json({ error: 'Database service is not configured' });
+    }
+
+    const { data: meeting, error: meetingErr } = await supabaseAdmin
+      .from('meetings')
+      .select('id, title, organization_id, host_id, status, google_space_name')
+      .eq('id', meetingId)
+      .maybeSingle();
+
+    if (meetingErr) {
+      return res.status(500).json({ error: meetingErr.message });
+    }
+    if (!meeting) {
+      return res.status(404).json({ error: 'That meeting does not exist.' });
+    }
+
+    const membership = await getCallerMembership(callerId, meeting.organization_id);
+    const isHost = meeting.host_id === callerId;
+    const isLead = Boolean(membership && MEETING_LEAD_ROLES.has(membership.role));
+
+    if (!isHost && !isLead) {
+      return res.status(403).json({
+        error: 'Only the meeting host or a team leader can end this meeting for everyone.',
+      });
+    }
+
+    // 1. Authoritative state first: completed stays completed, even if the
+    //    provider call below fails. Idempotent, so a retry cannot end a
+    //    different (new) session twice.
+    if (meeting.status !== 'completed' && meeting.status !== 'cancelled') {
+      const { error: updateErr } = await supabaseAdmin
+        .from('meetings')
+        .update({
+          status: 'completed',
+          actual_end_time: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', meetingId);
+      if (updateErr) {
+        return res.status(500).json({ error: `The meeting state could not be updated: ${updateErr.message}` });
+      }
+    }
+
+    // 2. End the active Google conference so everyone still in it is closed
+    //    out for real, not just marked completed locally.
+    //
+    //    Best effort and never fatal: the meeting is already durably
+    //    "completed" above, so if Google is unreachable, the link is stale or
+    //    the grant lacks the scope, the host still gets a success response
+    //    and members are released through the realtime subscription. Members
+    //    who leave on their own never reach this code — it runs only when an
+    //    authorised host or lead explicitly ends the meeting.
+    let conferenceEnded = false;
+    const googleCfg = meeting.google_space_name ? readGoogleMeetConfig() : null;
+    if (googleCfg) {
+      try {
+        await callMeetApi(
+          googleCfg,
+          `/spaces/${encodeURIComponent(meeting.google_space_name.replace(/^spaces\//, ''))}:endActiveConference`,
+          { method: 'POST', body: '{}' }
+        );
+        conferenceEnded = true;
+      } catch (closeErr) {
+        // Nothing active in the space (or already ended) answers with an
+        // error; the meeting is still completed for every client.
+        console.warn('Could not end the active Google Meet conference:', closeErr);
+      }
+    }
+
+    // 3. Audit trail, best effort.
+    try {
+      await supabaseAdmin.from('audit_logs').insert({
+        user_id: callerId,
+        action: 'MEETING_ENDED',
+        target_entity: 'meetings',
+        target_id: meeting.id,
+        details: { title: meeting.title, ended_by_host: isHost, conference_ended: conferenceEnded },
+        ip_address: req.ip || null,
+      });
+    } catch (auditErr) {
+      console.warn('Meeting-end audit entry failed:', auditErr);
+    }
+
+    return res.json({ success: true, conferenceEnded });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Ending the meeting failed';
+    console.error('Error ending meeting:', err);
     return res.status(500).json({ error: message });
   }
 });

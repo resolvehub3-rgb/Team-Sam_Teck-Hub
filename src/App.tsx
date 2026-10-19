@@ -66,8 +66,19 @@ const AppContent: React.FC = () => {
 
   useEffect(() => {
     const onPopState = () => setPathname(window.location.pathname);
+    // Programmatic navigation (e.g. the floating mini-window's "Return to
+    // meeting") pushes a URL and announces it here, since pushState alone
+    // fires no event the shell could listen to.
+    const onSamTeckNavigate = (event: Event) => {
+      const detail = (event as CustomEvent<string>).detail;
+      if (typeof detail === 'string') setPathname(detail);
+    };
     window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
+    window.addEventListener('samteck:navigate', onSamTeckNavigate);
+    return () => {
+      window.removeEventListener('popstate', onPopState);
+      window.removeEventListener('samteck:navigate', onSamTeckNavigate);
+    };
   }, []);
 
   const parsed = useMemo(() => parsePath(pathname), [pathname]);
@@ -324,9 +335,7 @@ const AppContent: React.FC = () => {
 };
 
 export default function App() {
-  return (
-    <AuthProvider>
-      <AppContent />
-    </AuthProvider>
-  );
+  return <AuthProvider>
+    <AppContent />
+  </AuthProvider>;
 }

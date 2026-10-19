@@ -103,27 +103,27 @@ export const AdminView: React.FC = () => {
           </p>
         </div>
 
-        {/* LiveKit Cloud Status */}
+        {/* Google Meet Integration Status */}
         <div className="bg-white p-5 rounded-xl border border-[#DCE5F0] shadow-xs space-y-2">
           <div className="flex items-center justify-between">
             <span className="text-xs font-bold text-[#172B4D] flex items-center gap-1.5">
               <Video className="w-4 h-4 text-emerald-600" />
-              LiveKit Cloud WebRTC
+              Google Meet (REST API)
             </span>
-            {healthStatus?.livekit?.configured ? (
+            {healthStatus?.googleMeet?.configured ? (
               <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
                 Operational
               </span>
             ) : (
-              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-50 text-blue-700 border border-blue-200">
-                Local Device Mode
+              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200">
+                Not configured
               </span>
             )}
           </div>
           <p className="text-xs text-[#65758B]">
-            {healthStatus?.livekit?.configured
-              ? 'WebRTC SFU room token generator active.'
-              : 'Local audio/video preview active. Add LIVEKIT_API_KEY for multi-party SFU.'}
+            {healthStatus?.googleMeet?.configured
+              ? 'Meeting spaces are created server-side with OAuth; the browser only receives join links.'
+              : `Add GOOGLE_MEET_CLIENT_ID, GOOGLE_MEET_CLIENT_SECRET and GOOGLE_MEET_REFRESH_TOKEN to the server environment.`}
           </p>
         </div>
 

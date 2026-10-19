@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Video,
   MapPin,
@@ -15,9 +15,18 @@ import { supabase, isSupabaseConfigured } from '../../lib/supabase';
 import { Meeting, MeetingActionItem, MeetingDecision, MeetingMinutes } from '../../types/database';
 import { describeAccessError, formatDate, formatDateTime, formatRelativeTime } from '../../utils/format';
 import { Chip, EmptyState, ErrorState, LoadingState, PageHeader, SectionCard, buttonStyles } from '../../components/ui';
-import { MeetingRoomView } from '../MeetingRoomView';
+import { JoinGoogleMeetButton } from '../../components/meeting/JoinGoogleMeetButton';
 
 type MeetingTab = 'upcoming' | 'invited' | 'previous';
+
+/** Roles the server accepts as able to provision a Google Meet space. */
+const MEETING_LEAD_ROLES = new Set([
+  'super_admin',
+  'team_leader',
+  'assistant_leader',
+  'project_manager',
+  'department_lead',
+]);
 
 /** Physical / hybrid sessions carry a location; virtual ones never show one. */
 function meetingKind(m: Meeting): 'virtual' | 'physical' | 'hybrid' {
@@ -25,22 +34,35 @@ function meetingKind(m: Meeting): 'virtual' | 'physical' | 'hybrid' {
   if (url.includes('meet.google.com') || url.includes('zoom.us')) {
     return m.meeting_url ? 'hybrid' : 'virtual';
   }
-  return m.livekit_room_name && m.status !== 'completed' ? (m.meeting_url ? 'hybrid' : 'virtual') : 'physical';
+  const hasVirtualSession = Boolean(m.google_meeting_uri || m.room_name);
+  return hasVirtualSession && m.status !== 'completed'
+    ? m.meeting_url
+      ? 'hybrid'
+      : 'virtual'
+    : 'physical';
 }
 
 export const MemberMeetingsView: React.FC<{
-  /** Room opened by a legacy `/meet/:slug` deep link. */
+  /** Meeting opened by a `/meet/:slug` deep link. */
   initialMeetingSlug?: string;
-  /** Called after the member leaves a room opened from a deep link. */
+  /** Called when the member closes a meeting opened from a deep link. */
   onLeaveMeeting?: () => void;
 }> = ({ initialMeetingSlug, onLeaveMeeting }) => {
-  const { user, organization } = useAuth();
+  const { user, organization, role } = useAuth();
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [invitedIds, setInvitedIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<MeetingTab>('upcoming');
-  const [active, setActive] = useState<Meeting | null>(null);
+  // The open meeting-details panel. Minutes, decisions and action items live
+  // here, and so does the real Google Meet join link.
+  const [openMeetingId, setOpenMeetingId] = useState<string | null>(null);
+
+  const active = meetings.find((m) => m.id === openMeetingId) ?? null;
+
+  /** Mirrors the server's rule for who may create a Google Meet space. */
+  const canManageMeeting = (m: Meeting) =>
+    m.host_id === user?.id || (typeof role === 'string' && MEETING_LEAD_ROLES.has(role));
 
   const [minutes, setMinutes] = useState<MeetingMinutes[]>([]);
   const [decisions, setDecisions] = useState<MeetingDecision[]>([]);
@@ -87,17 +109,17 @@ export const MemberMeetingsView: React.FC<{
     fetchMeetings();
   }, [fetchMeetings]);
 
-  // A shared `/meet/:slug` link must land in the room, not on a list the
-  // recipient then has to search. Consumed once so "Back to meetings" sticks.
-  const deepLinkConsumed = useRef(false);
+  // A shared `/meet/:slug` link must land on the meeting it names rather than
+  // a list the recipient then has to search. Opened once so "Back to
+  // meetings" sticks, and never while another meeting is already open.
   useEffect(() => {
-    if (!initialMeetingSlug || loading || active || deepLinkConsumed.current) return;
-    deepLinkConsumed.current = true;
+    if (!initialMeetingSlug || loading || openMeetingId) return;
     const match = meetings.find(
-      (m) => m.livekit_room_name === initialMeetingSlug || m.slug === initialMeetingSlug
+      (m) => m.slug === initialMeetingSlug || m.room_name === initialMeetingSlug
     );
-    if (match) setActive(match);
-  }, [initialMeetingSlug, loading, meetings, active]);
+    if (match) setOpenMeetingId(match.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialMeetingSlug, loading, meetings, openMeetingId]);
 
   // Meeting follow-up: minutes, decisions and any action items assigned out.
   useEffect(() => {
@@ -149,20 +171,36 @@ export const MemberMeetingsView: React.FC<{
     }
   };
 
-  const leaveMeeting = () => {
-    setActive(null);
+  // "Back to meetings" closes the details panel. Ending the Google Meet call
+  // itself is an explicit action inside Google's own interface (or the host's
+  // "End meeting" control) — closing this page never ends it for anyone.
+  const handleBackToList = () => {
+    setOpenMeetingId(null);
     onLeaveMeeting?.();
   };
 
   if (active) {
     return (
       <div className="space-y-4">
-        <button onClick={leaveMeeting} className={`${buttonStyles.secondary} w-fit`}>
+        <button onClick={handleBackToList} className={`${buttonStyles.secondary} w-fit`}>
           <ArrowLeft className="w-3.5 h-3.5" />
           Back to meetings
         </button>
 
-        <MeetingRoomView meeting={active} onLeaveMeeting={leaveMeeting} />
+        <MeetingDetailsHeader
+          meeting={active}
+          canManage={canManageMeeting(active)}
+          onBack={handleBackToList}
+          onSpaceCreated={(uri) =>
+            setMeetings((prev) =>
+              prev.map((m) =>
+                m.id === active.id
+                  ? { ...m, google_meeting_uri: uri, google_sync_status: 'synced', google_last_error: null }
+                  : m
+              )
+            )
+          }
+        />
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <SectionCard title="Minutes & notes" icon={FileText}>
@@ -355,11 +393,35 @@ export const MemberMeetingsView: React.FC<{
                       </>
                     )}
 
+                    <button
+                      onClick={() => setOpenMeetingId(meeting.id)}
+                      className={buttonStyles.secondary}
+                      title="Minutes, decisions and action items"
+                    >
+                      <FileText className="w-3.5 h-3.5" />
+                      Details
+                    </button>
+
                     {canJoin && (
-                      <button onClick={() => setActive(meeting)} className={buttonStyles.primary}>
-                        <Video className="w-3.5 h-3.5" />
-                        {isLive ? 'Join now' : kind === 'physical' ? 'Open details' : 'Open Sam_Teck Meet'}
-                      </button>
+                      <JoinGoogleMeetButton
+                        meeting={meeting}
+                        canManage={canManageMeeting(meeting)}
+                        compact
+                        onSpaceCreated={(space) =>
+                          setMeetings((prev) =>
+                            prev.map((m) =>
+                              m.id === meeting.id
+                                ? {
+                                    ...m,
+                                    google_meeting_uri: space.meetingUri,
+                                    google_sync_status: 'synced',
+                                    google_last_error: null,
+                                  }
+                                : m
+                            )
+                          )
+                        }
+                      />
                     )}
                   </div>
                 </div>
@@ -371,3 +433,68 @@ export const MemberMeetingsView: React.FC<{
     </div>
   );
 };
+
+/**
+ * Header of the open meeting: the facts a member needs before joining, the
+ * real Google Meet link, and an honest statement of what the link does.
+ *
+ * Deliberately contains no microphone, camera or participant controls —
+ * Google Meet owns those and cannot be rendered inside Sam_Teck Hub, so
+ * drawing them here would be a button that does nothing.
+ */
+const MeetingDetailsHeader: React.FC<{
+  meeting: Meeting;
+  canManage: boolean;
+  onBack: () => void;
+  onSpaceCreated?: (uri: string) => void;
+}> = ({ meeting, canManage, onBack, onSpaceCreated }) => (
+  <div className="bg-white p-5 rounded-xl border border-[#DCE5F0] shadow-xs">
+    <button onClick={onBack} className={`${buttonStyles.secondary} w-fit mb-4`}>
+      <ArrowLeft className="w-3.5 h-3.5" />
+      Back to meetings
+    </button>
+
+    <div className="flex flex-wrap items-start justify-between gap-4">
+      <div className="min-w-0 space-y-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <h2 className="text-base font-bold text-[#172B4D]">{meeting.title}</h2>
+          {meeting.status === 'live' && <Chip tone="danger">Live now</Chip>}
+          <Chip tone={meeting.status === 'completed' ? 'neutral' : 'info'}>{meeting.status}</Chip>
+        </div>
+
+        {meeting.description && (
+          <p className="text-xs text-[#65758B] whitespace-pre-wrap">{meeting.description}</p>
+        )}
+
+        <div className="text-[11px] text-[#65758B] flex flex-wrap gap-x-4 gap-y-1">
+          <span className="inline-flex items-center gap-1">
+            <CalendarDays className="w-3 h-3" />
+            {formatDateTime(meeting.start_time)}
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <Clock className="w-3 h-3" />
+            {meeting.duration_minutes} minutes
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <Phone className="w-3 h-3" />
+            {meeting.timezone}
+          </span>
+        </div>
+
+        <p className="text-[11px] text-[#65758B] max-w-xl leading-relaxed">
+          Joining opens <span className="font-semibold text-[#172B4D]">meet.google.com in a new
+          tab</span>. Google Meet cannot be displayed inside Sam_Teck Hub, and leaving this page
+          never ends the call for anyone else.
+        </p>
+      </div>
+
+      <div className="shrink-0">
+        <JoinGoogleMeetButton
+          meeting={meeting}
+          canManage={canManage}
+          onSpaceCreated={(space) => onSpaceCreated?.(space.meetingUri)}
+        />
+      </div>
+    </div>
+  </div>
+);

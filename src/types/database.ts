@@ -160,7 +160,21 @@ export interface Meeting {
   duration_minutes: number;
   timezone: string;
   status: MeetingStatus;
-  livekit_room_name: string;
+  /**
+   * Internal virtual-session key for this meeting (UNIQUE, NOT NULL).
+   * Renamed from `livekit_room_name` when the LiveKit transport was removed;
+   * existing values are preserved verbatim by the Google Meet migration.
+   */
+  room_name: string;
+  /** Google meeting-space resource name, e.g. `spaces/AbCdEfGhIjKlMnOp`. */
+  google_space_name?: string | null;
+  /** Join link returned by Google. Server-written; open in a new tab. */
+  google_meeting_uri?: string | null;
+  /** `pending` | `synced` | `failed` — server-side provisioning state. */
+  google_sync_status?: string | null;
+  /** Sanitised reason for the most recent provisioning failure. */
+  google_last_error?: string | null;
+  google_synced_at?: string | null;
   is_private: boolean;
   meeting_url?: string;
   actual_start_time?: string;
@@ -379,7 +393,7 @@ export interface AuditLogItem {
 export interface SystemHealthStatus {
   database_connected: boolean;
   database_version?: string;
-  livekit_configured: boolean;
+  google_meet_configured: boolean;
   initial_admin_provisioned: boolean;
   timestamp: string;
 }

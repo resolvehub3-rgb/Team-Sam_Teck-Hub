@@ -19,7 +19,6 @@ export default async function handler(
     'express',
     'dotenv',
     '@supabase/supabase-js',
-    'livekit-server-sdk',
   ];
 
   for (const pkg of packages) {
