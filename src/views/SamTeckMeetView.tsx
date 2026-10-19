@@ -166,14 +166,23 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
 
     if (orgId && isSupabaseConfigured()) {
       try {
+        // The host id must come from the live Supabase session, not from
+        // form state: the meetings INSERT policy requires
+        // host_id = auth.uid(), so anything else is guaranteed to fail.
+        const { data: sessionData } = await supabase.auth.getSession();
+        const sessionUserId = sessionData.session?.user.id;
+
         // Split into insert + read-back: `INSERT ... RETURNING` (the combined
-        // `.insert().select().single()` form) is rejected by RLS here even
-        // though the insert alone succeeds. See handleScheduleMeeting.
+        // `.insert().select()` form) used to be rejected by RLS because the
+        // old SELECT policy re-queried public.meetings from within itself.
+        // Migration 20261018120000 fixes that at the database level; the
+        // split insert stays because it also works against databases where
+        // that migration has not been applied yet.
         const { error: insertErr } = await supabase.from('meetings').insert({
           organization_id: orgId,
           title: instantMeeting.title,
           slug: instantMeeting.slug,
-          host_id: user.id,
+          host_id: sessionUserId || user.id,
           start_time: instantMeeting.start_time,
           duration_minutes: 60,
           timezone: instantMeeting.timezone,
@@ -181,13 +190,18 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
           livekit_room_name: roomName,
         });
 
-        if (!insertErr) {
-          const { data } = await supabase
+        if (insertErr) {
+          console.warn('Could not persist instant meeting to DB:', insertErr);
+        } else {
+          const { data, error: readErr } = await supabase
             .from('meetings')
             .select('*, host:profiles(*)')
             .eq('slug', instantMeeting.slug)
             .single();
 
+          if (readErr) {
+            console.warn('Could not read back the instant meeting:', readErr);
+          }
           if (data) {
             setActiveMeeting(data as Meeting);
             return;
@@ -204,7 +218,23 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
   // Schedule Meeting in Supabase
   const handleScheduleMeeting = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newTitle.trim() || !newDate || !user) return;
+    // The submit button is disabled while a request runs, but Enter in a
+    // text field still submits the form — guard here so a meeting can
+    // never be created twice by one fill of this dialog.
+    if (isSubmitting) return;
+    const title = newTitle.trim();
+    if (!title || !newDate || !user) return;
+
+    if (title.length < 2) {
+      alert('Please give the meeting a title of at least 2 characters.');
+      return;
+    }
+
+    const startDateTime = new Date(`${newDate}T${newTime || '00:00'}:00`);
+    if (Number.isNaN(startDateTime.getTime())) {
+      alert('Please choose a valid date and time for the meeting.');
+      return;
+    }
 
     if (!isSupabaseConfigured()) {
       alert(
@@ -213,6 +243,10 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
       return;
     }
 
+    // The organization id must come from the signed-in user's real active
+    // membership (loaded by AuthContext), never from the form: the meetings
+    // INSERT policy verifies it against organization_memberships, so a
+    // missing or fabricated id can only ever fail.
     if (!organization?.id) {
       alert(
         'Your account is not linked to an organization yet, so the meeting cannot be saved. ' +
@@ -221,30 +255,40 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
       return;
     }
 
+    // Belt and braces: make sure the browser really holds a Supabase
+    // session. Without one the insert would run as the anon role, which
+    // the meetings policies always reject.
+    const { data: sessionData } = await supabase.auth.getSession();
+    const sessionUser = sessionData.session?.user;
+    if (!sessionUser || sessionUser.id !== user.id) {
+      alert('Your session has expired. Please sign in again before scheduling a meeting.');
+      return;
+    }
+
     setIsSubmitting(true);
 
     try {
       const slug = newTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').substring(0, 20) + '-' + Math.random().toString(36).substring(2, 6);
       const roomName = 'samteck-' + slug;
-      const startDateTime = new Date(`${newDate}T${newTime}:00`).toISOString();
       const orgId = organization.id;
 
       // Insert and read-back are split into two calls on purpose.
       //
       // `INSERT ... RETURNING` (what `.insert().select().single()` produces)
-      // is rejected here with "new row violates row-level security policy
-      // for table meetings", even though the identical insert alone returns
-      // 201 and the identical select alone returns the row. Verified against
-      // the live database: plain INSERT -> 201, SELECT with the host join ->
-      // 200, but INSERT ... RETURNING -> 403. Doing them separately works.
+      // used to be rejected here with "new row violates row-level security
+      // policy for table meetings" because the old SELECT policy re-queried
+      // public.meetings from within itself and could not see the row being
+      // inserted. Migration 20261018120000 fixes that at the database
+      // level; the split insert stays because it also works against
+      // databases where that migration has not been applied yet.
       const { error: insertErr } = await supabase.from('meetings').insert({
         organization_id: orgId,
-        title: newTitle.trim(),
+        title,
         slug,
         description: newDesc.trim() || null,
         project_id: newProjectId || null,
-        host_id: user.id,
-        start_time: startDateTime,
+        host_id: sessionUser.id,
+        start_time: startDateTime.toISOString(),
         duration_minutes: parseInt(newDuration, 10) || 45,
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         status: 'scheduled',
@@ -270,13 +314,21 @@ export const SamTeckMeetView: React.FC<SamTeckMeetViewProps> = ({
         setMeetings((prev) => [data as Meeting, ...prev]);
       }
     } catch (err) {
+      // Full diagnostics stay in the browser console; the user gets an
+      // explanation they can act on, without raw policy or schema details.
       console.error('Error creating meeting:', err);
-      const msg = getErrorMessage(err, 'Unknown error');
-      const details =
-        err && typeof err === 'object' && 'details' in err && (err as { details?: string }).details
-          ? ` (${(err as { details: string }).details})`
-          : '';
-      alert('Failed to schedule meeting: ' + msg + details);
+      const code = (err as { code?: string })?.code || '';
+      const raw = getErrorMessage(err, '');
+      if (code === '42501' || /row-level security/i.test(raw)) {
+        alert(
+          'You are not permitted to schedule meetings for this workspace. ' +
+            'Ask your team leader or a Super Administrator to check your role and organization membership.'
+        );
+      } else if (code === '23502' || code === '22007' || code === '22P02') {
+        alert('Some required meeting details are missing or invalid. Please check the title, date and time.');
+      } else {
+        alert(raw ? `Failed to schedule meeting: ${raw}` : 'Failed to schedule meeting. Please try again.');
+      }
     } finally {
       setIsSubmitting(false);
     }
